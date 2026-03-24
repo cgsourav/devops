@@ -1,0 +1,15 @@
+.env
+.env.example
+*.pem
+.aws-provision-state.json
+.deploy-meta.json
+terraform.tfstate
+terraform.tfstate.*
+.terraform/
+.terraform.lock.hcl
+crash.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+bin/.theiux-context

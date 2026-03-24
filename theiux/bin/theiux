@@ -1,0 +1,217 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+TERRAFORM_DIR="${ROOT_DIR}/terraform"
+CTX_FILE="${ROOT_DIR}/bin/.theiux-context"
+
+command="${1:-}"
+arg1="${2:-default}"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  theiux init
+  theiux deploy <app>
+  theiux rollback <app>
+  theiux destroy <app>
+  theiux deploy-site --domain <domain> [--apps app1,app2]
+  theiux list-sites
+  theiux remove-site --domain <domain> [--drop-db]
+EOF
+}
+
+ensure_ctx() {
+  if [ ! -f "${CTX_FILE}" ]; then
+    echo "Run 'theiux init' first." >&2
+    exit 1
+  fi
+  # shellcheck disable=SC1090
+  source "${CTX_FILE}"
+}
+
+terraform_output() {
+  terraform -chdir="${TERRAFORM_DIR}" output -raw "$1"
+}
+
+wait_ssm() {
+  local command_id="$1"
+  local instance_id="$2"
+  local region="$3"
+  aws ssm wait command-executed --region "${region}" --command-id "${command_id}" --instance-id "${instance_id}"
+  aws ssm get-command-invocation \
+    --region "${region}" \
+    --command-id "${command_id}" \
+    --instance-id "${instance_id}" \
+    --query '{Status:Status,Stdout:StandardOutputContent,Stderr:StandardErrorContent}' \
+    --output json
+}
+
+case "${command}" in
+  init)
+    terraform -chdir="${TERRAFORM_DIR}" init
+    terraform -chdir="${TERRAFORM_DIR}" apply -auto-approve
+    cat > "${CTX_FILE}" <<EOF
+AWS_REGION=$(terraform_output aws_region)
+INSTANCE_ID=$(terraform_output instance_id)
+SSM_PARAMETER_PATH=$(terraform_output ssm_parameter_path)
+DEPLOY_PATH=$(terraform_output deploy_path)
+EOF
+    echo "Initialized infrastructure."
+    echo "Instance: $(terraform_output instance_id)"
+    echo "ECR: $(terraform_output ecr_repository_url)"
+    ;;
+  deploy)
+    ensure_ctx
+    IMAGE_TAG="${IMAGE_TAG:-$(git -C "${ROOT_DIR}" rev-parse --short HEAD)}"
+    PAYLOAD="$(cat <<EOF
+{"commands":[
+  "set -euo pipefail",
+  "cd ${DEPLOY_PATH}",
+  "PROJECT_ROOT=${DEPLOY_PATH} AWS_REGION=${AWS_REGION} PARAMETER_PATH=${SSM_PARAMETER_PATH} scripts/ssm-deploy.sh ${IMAGE_TAG}"
+]}
+EOF
+)"
+    COMMAND_ID="$(
+      aws ssm send-command \
+        --region "${AWS_REGION}" \
+        --document-name "AWS-RunShellScript" \
+        --instance-ids "${INSTANCE_ID}" \
+        --parameters "${PAYLOAD}" \
+        --query 'Command.CommandId' \
+        --output text
+    )"
+    wait_ssm "${COMMAND_ID}" "${INSTANCE_ID}" "${AWS_REGION}"
+    echo "Deployed app '${arg1}' with image tag ${IMAGE_TAG}"
+    ;;
+  rollback)
+    ensure_ctx
+    PAYLOAD="$(cat <<EOF
+{"commands":[
+  "set -euo pipefail",
+  "cd ${DEPLOY_PATH}",
+  "PROJECT_ROOT=${DEPLOY_PATH} scripts/rollback.sh"
+]}
+EOF
+)"
+    COMMAND_ID="$(
+      aws ssm send-command \
+        --region "${AWS_REGION}" \
+        --document-name "AWS-RunShellScript" \
+        --instance-ids "${INSTANCE_ID}" \
+        --parameters "${PAYLOAD}" \
+        --query 'Command.CommandId' \
+        --output text
+    )"
+    wait_ssm "${COMMAND_ID}" "${INSTANCE_ID}" "${AWS_REGION}"
+    echo "Rollback executed for app '${arg1}'"
+    ;;
+  destroy)
+    terraform -chdir="${TERRAFORM_DIR}" destroy -auto-approve
+    rm -f "${CTX_FILE}"
+    echo "Destroyed infrastructure for app '${arg1}'"
+    ;;
+  deploy-site)
+    ensure_ctx
+    shift || true
+    DOMAIN=""
+    APPS=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --domain) DOMAIN="${2:-}"; shift 2 ;;
+        --apps) APPS="${2:-}"; shift 2 ;;
+        *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
+      esac
+    done
+    if [ -z "${DOMAIN}" ]; then
+      echo "--domain is required" >&2
+      exit 1
+    fi
+    APPS_CMD=""
+    if [ -n "${APPS}" ]; then
+      APPS_CMD="--apps ${APPS}"
+    fi
+    PAYLOAD="$(cat <<EOF
+{"commands":[
+  "set -euo pipefail",
+  "cd ${DEPLOY_PATH}",
+  "PROJECT_ROOT=${DEPLOY_PATH} scripts/site-lifecycle.sh deploy-site --domain ${DOMAIN} ${APPS_CMD}"
+]}
+EOF
+)"
+    COMMAND_ID="$(
+      aws ssm send-command \
+        --region "${AWS_REGION}" \
+        --document-name "AWS-RunShellScript" \
+        --instance-ids "${INSTANCE_ID}" \
+        --parameters "${PAYLOAD}" \
+        --query 'Command.CommandId' \
+        --output text
+    )"
+    wait_ssm "${COMMAND_ID}" "${INSTANCE_ID}" "${AWS_REGION}"
+    ;;
+  list-sites)
+    ensure_ctx
+    PAYLOAD="$(cat <<EOF
+{"commands":[
+  "set -euo pipefail",
+  "cd ${DEPLOY_PATH}",
+  "PROJECT_ROOT=${DEPLOY_PATH} scripts/site-lifecycle.sh list-sites"
+]}
+EOF
+)"
+    COMMAND_ID="$(
+      aws ssm send-command \
+        --region "${AWS_REGION}" \
+        --document-name "AWS-RunShellScript" \
+        --instance-ids "${INSTANCE_ID}" \
+        --parameters "${PAYLOAD}" \
+        --query 'Command.CommandId' \
+        --output text
+    )"
+    wait_ssm "${COMMAND_ID}" "${INSTANCE_ID}" "${AWS_REGION}"
+    ;;
+  remove-site)
+    ensure_ctx
+    shift || true
+    DOMAIN=""
+    DROP_DB="false"
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --domain) DOMAIN="${2:-}"; shift 2 ;;
+        --drop-db) DROP_DB="true"; shift 1 ;;
+        *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
+      esac
+    done
+    if [ -z "${DOMAIN}" ]; then
+      echo "--domain is required" >&2
+      exit 1
+    fi
+    DROP_DB_FLAG=""
+    if [ "${DROP_DB}" = "true" ]; then
+      DROP_DB_FLAG="--drop-db"
+    fi
+    PAYLOAD="$(cat <<EOF
+{"commands":[
+  "set -euo pipefail",
+  "cd ${DEPLOY_PATH}",
+  "PROJECT_ROOT=${DEPLOY_PATH} scripts/site-lifecycle.sh remove-site --domain ${DOMAIN} ${DROP_DB_FLAG}"
+]}
+EOF
+)"
+    COMMAND_ID="$(
+      aws ssm send-command \
+        --region "${AWS_REGION}" \
+        --document-name "AWS-RunShellScript" \
+        --instance-ids "${INSTANCE_ID}" \
+        --parameters "${PAYLOAD}" \
+        --query 'Command.CommandId' \
+        --output text
+    )"
+    wait_ssm "${COMMAND_ID}" "${INSTANCE_ID}" "${AWS_REGION}"
+    ;;
+  *)
+    usage
+    exit 1
+    ;;
+esac

@@ -1,0 +1,171 @@
+name: ${COMPOSE_PROJECT_NAME:-theiux}
+
+x-frappe-image: &frappe-image
+  image: ${FRAPPE_IMAGE_REPO}:${IMAGE_TAG}
+  restart: unless-stopped
+  env_file:
+    - .env
+  volumes:
+    - sites:/home/frappe/frappe-bench/sites
+    - logs:/home/frappe/frappe-bench/logs
+  networks:
+    - edge
+  logging:
+    driver: awslogs
+    options:
+      awslogs-region: ${AWS_REGION}
+      awslogs-group: ${CLOUDWATCH_LOG_GROUP:-/theiux/prod/containers}
+      awslogs-stream: "${STACK_COLOR:-blue}-${COMPOSE_PROJECT_NAME:-theiux}"
+
+services:
+  frappe:
+    <<: *frappe-image
+    container_name: theiux-${STACK_COLOR:-blue}-frappe
+    command: ["backend"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sS -H 'Host: ${HEALTHCHECK_HOST:-roguesingh.cloud}' http://127.0.0.1:${FRAPPE_PORT:-8000}/api/method/ping >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  worker:
+    <<: *frappe-image
+    container_name: theiux-${STACK_COLOR:-blue}-worker
+    command: ["worker"]
+    environment:
+      WORKER_PROCESSES: ${WORKER_PROCESSES:-2}
+      WORKER_QUEUES: ${WORKER_QUEUES:-short,default,long}
+
+  scheduler:
+    <<: *frappe-image
+    container_name: theiux-${STACK_COLOR:-blue}-scheduler
+    command: ["scheduler"]
+
+  websocket:
+    <<: *frappe-image
+    container_name: theiux-${STACK_COLOR:-blue}-websocket
+    command: ["websocket"]
+
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: theiux-edge-nginx
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "${HTTP_PORT:-80}:80"
+      - "${HTTPS_PORT:-443}:443"
+    volumes:
+      - sites:/var/www/html:ro
+      - letsencrypt:/etc/letsencrypt
+      - certbot-webroot:/var/www/certbot
+      - ./docker/nginx/nginx.http.conf.template:/etc/nginx/templates/nginx.http.conf.template:ro
+      - ./docker/nginx/nginx.https.conf.template:/etc/nginx/templates/nginx.https.conf.template:ro
+      - ./docker/nginx/start-nginx.sh:/usr/local/bin/start-nginx.sh:ro
+    command: ["/bin/sh", "/usr/local/bin/start-nginx.sh"]
+    networks:
+      - edge
+    logging:
+      driver: awslogs
+      options:
+        awslogs-region: ${AWS_REGION}
+        awslogs-group: ${CLOUDWATCH_LOG_GROUP:-/theiux/prod/containers}
+        awslogs-stream: edge-nginx
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1/ || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  certbot:
+    image: certbot/certbot:latest
+    container_name: theiux-edge-certbot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - letsencrypt:/etc/letsencrypt
+      - certbot-webroot:/var/www/certbot
+      - sites:/var/www/sites:ro
+      - ./docker/certbot/renew.sh:/usr/local/bin/renew.sh:ro
+    entrypoint: ["/bin/sh", "/usr/local/bin/renew.sh"]
+    networks:
+      - edge
+    logging:
+      driver: awslogs
+      options:
+        awslogs-region: ${AWS_REGION}
+        awslogs-group: ${CLOUDWATCH_LOG_GROUP:-/theiux/prod/containers}
+        awslogs-stream: edge-certbot
+
+  mariadb:
+    image: mariadb:10.11
+    container_name: theiux-mariadb
+    restart: unless-stopped
+    command:
+      [
+        "--character-set-server=utf8mb4",
+        "--collation-server=utf8mb4_unicode_ci",
+        "--innodb-buffer-pool-size=512M",
+        "--innodb-log-file-size=128M",
+        "--max-connections=220",
+        "--thread-cache-size=50"
+      ]
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${MYSQL_DATABASE}
+      MYSQL_USER: ${MYSQL_USER}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+    volumes:
+      - mariadb-data:/var/lib/mysql
+    profiles: ["internal-db"]
+    networks:
+      - edge
+    logging:
+      driver: awslogs
+      options:
+        awslogs-region: ${AWS_REGION}
+        awslogs-group: ${CLOUDWATCH_LOG_GROUP:-/theiux/prod/containers}
+        awslogs-stream: mariadb
+    healthcheck:
+      test: ["CMD-SHELL", "mariadb-admin ping -h 127.0.0.1 -u root -p$${MYSQL_ROOT_PASSWORD} --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: theiux-redis
+    restart: unless-stopped
+    command:
+      [
+        "redis-server",
+        "--save",
+        "",
+        "--appendonly",
+        "no",
+        "--maxmemory",
+        "512mb",
+        "--maxmemory-policy",
+        "allkeys-lru"
+      ]
+    profiles: ["internal-redis"]
+    networks:
+      - edge
+    logging:
+      driver: awslogs
+      options:
+        awslogs-region: ${AWS_REGION}
+        awslogs-group: ${CLOUDWATCH_LOG_GROUP:-/theiux/prod/containers}
+        awslogs-stream: redis
+
+volumes:
+  sites:
+  logs:
+  mariadb-data:
+  letsencrypt:
+  certbot-webroot:
+
+networks:
+  edge:
+    name: theiux-edge

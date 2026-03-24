@@ -1,0 +1,130 @@
+name: Build and Deploy theiux
+
+on:
+  push:
+    branches: ["main"]
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push image
+        id: build-image
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+          APPS_JSON_BASE64: ${{ vars.APPS_JSON_BASE64 }}
+          GITHUB_PAT: ${{ secrets.GH_APP_SOURCE_PAT }}
+        run: |
+          IMAGE_URI="${REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+          docker buildx build \
+            --push \
+            --build-arg PYTHON_VERSION="${{ vars.PYTHON_VERSION || '3.11' }}" \
+            --build-arg NODE_VERSION="${{ vars.NODE_VERSION || '20' }}" \
+            --build-arg WKHTMLTOPDF_VERSION="${{ vars.WKHTMLTOPDF_VERSION || '0.12.6.1-3' }}" \
+            --build-arg APPS_JSON_BASE64="${APPS_JSON_BASE64}" \
+            --secret id=github_pat,env=GITHUB_PAT \
+            -f docker/frappe/Dockerfile \
+            -t "${IMAGE_URI}" \
+            .
+          echo "image_uri=${IMAGE_URI}" >> "$GITHUB_OUTPUT"
+          echo "image_tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Update image repository parameter
+        env:
+          PARAMETER_PATH: ${{ vars.SSM_PARAMETER_PATH }}
+          FRAPPE_IMAGE_REPO: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${PARAMETER_PATH}" ]; then
+            echo "Missing vars.SSM_PARAMETER_PATH" >&2
+            exit 1
+          fi
+          aws ssm put-parameter \
+            --region "${AWS_REGION}" \
+            --name "${PARAMETER_PATH}/FRAPPE_IMAGE_REPO" \
+            --type "String" \
+            --overwrite \
+            --value "${FRAPPE_IMAGE_REPO}" >/dev/null
+
+      - name: Deploy to EC2
+        env:
+          IMAGE_TAG: ${{ steps.build-image.outputs.image_tag }}
+          AWS_REGION: ${{ env.AWS_REGION }}
+          INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID }}
+          PARAMETER_PATH: ${{ vars.SSM_PARAMETER_PATH }}
+          DEPLOY_PATH: ${{ vars.EC2_DEPLOY_PATH }}
+          GIT_REF: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [ -z "${INSTANCE_ID}" ]; then
+            echo "Missing vars.EC2_INSTANCE_ID" >&2
+            exit 1
+          fi
+          if [ -z "${PARAMETER_PATH}" ]; then
+            echo "Missing vars.SSM_PARAMETER_PATH" >&2
+            exit 1
+          fi
+          if [ -z "${DEPLOY_PATH}" ]; then
+            echo "Missing vars.EC2_DEPLOY_PATH" >&2
+            exit 1
+          fi
+
+          PAYLOAD="$(cat <<EOF
+          {"commands":[
+            "set -euo pipefail",
+            "cd ${DEPLOY_PATH}",
+            "chmod +x scripts/*.sh",
+            "PROJECT_ROOT=${DEPLOY_PATH} AWS_REGION=${AWS_REGION} PARAMETER_PATH=${PARAMETER_PATH} GIT_REF=${GIT_REF} scripts/ssm-deploy.sh ${IMAGE_TAG}"
+          ]}
+          EOF
+          )"
+
+          COMMAND_ID="$(
+            aws ssm send-command \
+              --region "${AWS_REGION}" \
+              --document-name "AWS-RunShellScript" \
+              --instance-ids "${INSTANCE_ID}" \
+              --comment "theiux deploy ${IMAGE_TAG}" \
+              --parameters "${PAYLOAD}" \
+              --query 'Command.CommandId' \
+              --output text
+          )"
+          echo "SSM command id: ${COMMAND_ID}"
+
+          aws ssm wait command-executed \
+            --region "${AWS_REGION}" \
+            --command-id "${COMMAND_ID}" \
+            --instance-id "${INSTANCE_ID}"
+
+          STATUS="$(
+            aws ssm get-command-invocation \
+              --region "${AWS_REGION}" \
+              --command-id "${COMMAND_ID}" \
+              --instance-id "${INSTANCE_ID}" \
+              --query 'Status' \
+              --output text
+          )"
+          echo "SSM command status: ${STATUS}"
+          test "${STATUS}" = "Success"
