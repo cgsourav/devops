@@ -19,6 +19,12 @@ HEALTH_ENDPOINT="${SITE_HEALTH_ENDPOINT:-/api/method/ping}"
 FRAPPE_SERVICE="${FRAPPE_SERVICE:-frappe}"
 NGINX_SERVICE="${NGINX_SERVICE:-nginx}"
 CERTBOT_SERVICE="${CERTBOT_SERVICE:-certbot}"
+SITE_RATE_LIMIT_RPS="${SITE_RATE_LIMIT_RPS:-20}"
+SITE_RATE_LIMIT_BURST="${SITE_RATE_LIMIT_BURST:-40}"
+SITE_CONN_LIMIT="${SITE_CONN_LIMIT:-30}"
+SITE_ISOLATION_MODE="${WORKER_SITE_ISOLATION_MODE:-shared}"
+TENANT_QUEUE_MODE="${TENANT_QUEUE_MODE:-shared}"
+TENANT_DB_MAX_USER_CONNECTIONS="${TENANT_DB_MAX_USER_CONNECTIONS:-15}"
 
 usage() {
   cat <<'EOF'
@@ -47,6 +53,44 @@ upsert_site_registry() {
     mkdir -p sites
     touch 'sites/${SITE_REGISTRY_FILE}'
     grep -qE '^${domain},${domain}\$' 'sites/${SITE_REGISTRY_FILE}' || echo '${domain},${domain}' >> 'sites/${SITE_REGISTRY_FILE}'
+  "
+}
+
+write_site_policy() {
+  compose_exec "
+    set -euo pipefail
+    cd '${BENCH_DIR}'
+    mkdir -p 'sites/${domain}'
+    cat > 'sites/${domain}/tenant-policy.json' <<EOF
+{
+  \"site\": \"${domain}\",
+  \"worker_mode\": \"${SITE_ISOLATION_MODE}\",
+  \"queue_mode\": \"${TENANT_QUEUE_MODE}\",
+  \"worker_queues\": \"${WORKER_QUEUES:-short,default,long}\",
+  \"rate_limit_rps\": ${SITE_RATE_LIMIT_RPS},
+  \"rate_limit_burst\": ${SITE_RATE_LIMIT_BURST},
+  \"concurrent_connection_limit\": ${SITE_CONN_LIMIT}
+}
+
+enforce_tenant_db_fairness() {
+  compose_exec "
+    set -euo pipefail
+    cd '${BENCH_DIR}'
+    db_name=\$(jq -r '.db_name // empty' 'sites/${domain}/site_config.json')
+    if [ -z \"\$db_name\" ]; then
+      echo 'Unable to resolve db_name for ${domain}' >&2
+      exit 1
+    fi
+    mysql -h '${DB_HOST}' -P '${DB_PORT}' -u root -p'${MYSQL_ROOT_PASSWORD}' <<SQL
+ALTER USER '\${db_name}'@'%' WITH MAX_USER_CONNECTIONS ${TENANT_DB_MAX_USER_CONNECTIONS};
+ALTER USER '\${db_name}'@'localhost' WITH MAX_USER_CONNECTIONS ${TENANT_DB_MAX_USER_CONNECTIONS};
+SQL
+  "
+}
+EOF
+    bench --site '${domain}' set-config -g rate_limit_rps '${SITE_RATE_LIMIT_RPS}' >/dev/null
+    bench --site '${domain}' set-config -g rate_limit_burst '${SITE_RATE_LIMIT_BURST}' >/dev/null
+    bench --site '${domain}' set-config -g connection_limit '${SITE_CONN_LIMIT}' >/dev/null
   "
 }
 
@@ -120,6 +164,8 @@ case "${command}" in
     done
 
     upsert_site_registry
+    write_site_policy
+    enforce_tenant_db_fairness
     refresh_site_hosts_env
     reload_edge
     validate_health

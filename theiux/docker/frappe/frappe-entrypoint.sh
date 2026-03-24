@@ -10,9 +10,9 @@ APPS_JSON_BASE64="${APPS_JSON_BASE64:-}"
 
 DB_HOST="${DB_HOST:-mariadb}"
 DB_PORT="${DB_PORT:-3306}"
-REDIS_CACHE="${REDIS_CACHE:-redis://redis-cache:6379}"
-REDIS_QUEUE="${REDIS_QUEUE:-redis://redis-queue:6379}"
-REDIS_SOCKETIO="${REDIS_SOCKETIO:-redis://redis-socketio:6379}"
+REDIS_CACHE="${REDIS_CACHE:-redis://redis-cache:6379/0}"
+REDIS_QUEUE="${REDIS_QUEUE:-redis://redis-queue:6379/1}"
+REDIS_SOCKETIO="${REDIS_SOCKETIO:-redis://redis-queue:6379/2}"
 SOCKETIO_PORT="${SOCKETIO_PORT:-9000}"
 FRAPPE_PORT="${FRAPPE_PORT:-8000}"
 FRAPPE_USER="${FRAPPE_USER:-frappe}"
@@ -25,6 +25,10 @@ APPS_TO_INSTALL="${APPS_TO_INSTALL:-frappe}"
 SITE_REGISTRY_FILE="${SITE_REGISTRY_FILE:-sites-enabled.csv}"
 WORKER_PROCESSES="${WORKER_PROCESSES:-2}"
 WORKER_QUEUES="${WORKER_QUEUES:-short,default,long}"
+ENABLE_DEDICATED_SITE_WORKERS="${ENABLE_DEDICATED_SITE_WORKERS:-false}"
+DEDICATED_SITE_WORKERS="${DEDICATED_SITE_WORKERS:-}"
+WORKER_SITE_ISOLATION_MODE="${WORKER_SITE_ISOLATION_MODE:-shared}"
+TENANT_QUEUE_MODE="${TENANT_QUEUE_MODE:-shared}"
 
 mkdir -p "${SITES_DIR}" "${BENCH_DIR}/logs"
 touch "${SITES_DIR}/${SITE_REGISTRY_FILE}"
@@ -137,12 +141,25 @@ case "${ROLE}" in
     ;;
   worker)
     run_as_frappe bash -lc "cd '${BENCH_DIR}' && \
-      i=1; \
-      while [ \"\$i\" -lt \"${WORKER_PROCESSES}\" ]; do \
-        bench worker --queue '${WORKER_QUEUES}' & \
-        i=\$((i+1)); \
+      if [ '${WORKER_SITE_ISOLATION_MODE}' = 'shared' ] || [ '${ENABLE_DEDICATED_SITE_WORKERS}' != 'true' ]; then \
+        i=1; \
+        while [ \"\$i\" -lt \"${WORKER_PROCESSES}\" ]; do \
+          bench worker --queue '${WORKER_QUEUES}' & \
+          i=\$((i+1)); \
+        done; \
+        exec bench worker --queue '${WORKER_QUEUES}'; \
+      fi; \
+      for site in \$(echo '${DEDICATED_SITE_WORKERS}' | tr ',' ' '); do \
+        if [ -n \"\$site\" ]; then \
+          if [ '${TENANT_QUEUE_MODE}' = 'namespaced' ]; then \
+            site_queues=\"\$(echo '${WORKER_QUEUES}' | awk -v s=\"\$site\" -F',' '{for(i=1;i<=NF;i++){gsub(/^ +| +$/, \"\", \$i); if(length(\$i)>0){printf \"%s%s:%s\", (c++?\",\":\"\"), s, \$i}}}')\"; \
+          else \
+            site_queues='${WORKER_QUEUES}'; \
+          fi; \
+          bench worker --site \"\$site\" --queue \"\$site_queues\" & \
+        fi; \
       done; \
-      exec bench worker --queue '${WORKER_QUEUES}'"
+      exec sleep infinity"
     ;;
   scheduler)
     if [ "$(id -u)" -eq 0 ]; then

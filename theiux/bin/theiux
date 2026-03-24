@@ -18,6 +18,9 @@ Usage:
   theiux deploy-site --domain <domain> [--apps app1,app2]
   theiux list-sites
   theiux remove-site --domain <domain> [--drop-db]
+  theiux health [site <domain>]
+  theiux logs --site <domain> [--since 10m]
+  theiux restore-site --domain <domain> --backup-file </path/file.sql.gz>
 EOF
 }
 
@@ -196,6 +199,107 @@ EOF
   "set -euo pipefail",
   "cd ${DEPLOY_PATH}",
   "PROJECT_ROOT=${DEPLOY_PATH} scripts/site-lifecycle.sh remove-site --domain ${DOMAIN} ${DROP_DB_FLAG}"
+]}
+EOF
+)"
+    COMMAND_ID="$(
+      aws ssm send-command \
+        --region "${AWS_REGION}" \
+        --document-name "AWS-RunShellScript" \
+        --instance-ids "${INSTANCE_ID}" \
+        --parameters "${PAYLOAD}" \
+        --query 'Command.CommandId' \
+        --output text
+    )"
+    wait_ssm "${COMMAND_ID}" "${INSTANCE_ID}" "${AWS_REGION}"
+    ;;
+  health)
+    ensure_ctx
+    if [ "${2:-}" = "site" ]; then
+      DOMAIN="${3:-}"
+      if [ -z "${DOMAIN}" ]; then
+        echo "Usage: theiux health site <domain>" >&2
+        exit 1
+      fi
+      HEALTH_CMD="PROJECT_ROOT=${DEPLOY_PATH} scripts/site-health.sh site ${DOMAIN}"
+    else
+      HEALTH_CMD="PROJECT_ROOT=${DEPLOY_PATH} scripts/site-health.sh summary"
+    fi
+    PAYLOAD="$(cat <<EOF
+{"commands":[
+  "set -euo pipefail",
+  "cd ${DEPLOY_PATH}",
+  "${HEALTH_CMD}"
+]}
+EOF
+)"
+    COMMAND_ID="$(
+      aws ssm send-command \
+        --region "${AWS_REGION}" \
+        --document-name "AWS-RunShellScript" \
+        --instance-ids "${INSTANCE_ID}" \
+        --parameters "${PAYLOAD}" \
+        --query 'Command.CommandId' \
+        --output text
+    )"
+    wait_ssm "${COMMAND_ID}" "${INSTANCE_ID}" "${AWS_REGION}"
+    ;;
+  logs)
+    ensure_ctx
+    shift || true
+    SITE=""
+    SINCE="15m"
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --site) SITE="${2:-}"; shift 2 ;;
+        --since) SINCE="${2:-}"; shift 2 ;;
+        *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
+      esac
+    done
+    if [ -z "${SITE}" ]; then
+      echo "--site is required" >&2
+      exit 1
+    fi
+    PAYLOAD="$(cat <<EOF
+{"commands":[
+  "set -euo pipefail",
+  "cd ${DEPLOY_PATH}",
+  "PROJECT_ROOT=${DEPLOY_PATH} scripts/logs-site.sh --site ${SITE} --since ${SINCE}"
+]}
+EOF
+)"
+    COMMAND_ID="$(
+      aws ssm send-command \
+        --region "${AWS_REGION}" \
+        --document-name "AWS-RunShellScript" \
+        --instance-ids "${INSTANCE_ID}" \
+        --parameters "${PAYLOAD}" \
+        --query 'Command.CommandId' \
+        --output text
+    )"
+    wait_ssm "${COMMAND_ID}" "${INSTANCE_ID}" "${AWS_REGION}"
+    ;;
+  restore-site)
+    ensure_ctx
+    shift || true
+    DOMAIN=""
+    BACKUP_FILE=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --domain) DOMAIN="${2:-}"; shift 2 ;;
+        --backup-file) BACKUP_FILE="${2:-}"; shift 2 ;;
+        *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
+      esac
+    done
+    if [ -z "${DOMAIN}" ] || [ -z "${BACKUP_FILE}" ]; then
+      echo "--domain and --backup-file are required" >&2
+      exit 1
+    fi
+    PAYLOAD="$(cat <<EOF
+{"commands":[
+  "set -euo pipefail",
+  "cd ${DEPLOY_PATH}",
+  "PROJECT_ROOT=${DEPLOY_PATH} scripts/site-restore.sh --domain ${DOMAIN} --backup-file ${BACKUP_FILE}"
 ]}
 EOF
 )"

@@ -179,6 +179,22 @@ Use this for acceptance testing:
 5. Verify no manual bench command is needed by operator
 6. Run moderate concurrent traffic and check worker queue stability
 
+## Production Hardening
+
+- **Tenant protection**: host+IP rate limiting and connection caps in NGINX templates.
+- **Worker isolation modes**:
+  - shared (`WORKER_SITE_ISOLATION_MODE=shared`)
+  - optional dedicated-site workers (`ENABLE_DEDICATED_SITE_WORKERS=true`, `DEDICATED_SITE_WORKERS=siteA,siteB`)
+- **Health dashboard**:
+  - `./bin/theiux health`
+  - `./bin/theiux health site <domain>`
+- **Site-scoped logs**:
+  - `./bin/theiux logs --site <domain> --since 15m`
+- **Safe restore**:
+  - `./bin/theiux restore-site --domain <domain> --backup-file /opt/theiux/backups/<ts>/...sql.gz`
+- **Retention**:
+  - local backup pruning via `SITE_BACKUP_RETENTION_DAYS`
+
 ## Compatibility Notes
 
 - Preserves current EC2-based deployment model

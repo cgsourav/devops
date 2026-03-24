@@ -1,5 +1,4 @@
 .env
-.env.example
 *.pem
 .aws-provision-state.json
 .deploy-meta.json

@@ -1,0 +1,13 @@
+aws_region      = "us-east-1"
+project_name    = "theiux"
+environment     = "prod"
+repo_url        = "https://github.com/your-org/theiux.git"
+repo_ref        = "main"
+deploy_path     = "/opt/theiux"
+instance_type   = "t3.small"
+root_volume_size_gb = 40
+
+# Optional DNS automation
+# route53_zone_id = "Z1234567890"
+# root_domain     = "example.com"
+# subdomain       = "app"

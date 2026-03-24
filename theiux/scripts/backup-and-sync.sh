@@ -15,6 +15,7 @@ set +a
 
 timestamp="$(date +%Y%m%d-%H%M%S)"
 backup_dir="${PROJECT_ROOT}/backups/${timestamp}"
+retention_days="${SITE_BACKUP_RETENTION_DAYS:-14}"
 mkdir -p "${backup_dir}"
 
 echo "Creating database dump..."
@@ -58,3 +59,8 @@ if [ "${ENABLE_S3_SITE_SYNC:-false}" = "true" ] && [ -n "${S3_SITE_SYNC_BUCKET:-
 fi
 
 echo "Backup complete at ${backup_dir}"
+
+echo "Pruning local backups older than ${retention_days} days..."
+if [ -d "${PROJECT_ROOT}/backups" ]; then
+  find "${PROJECT_ROOT}/backups" -mindepth 1 -maxdepth 1 -type d -mtime +"${retention_days}" -exec rm -rf {} +
+fi

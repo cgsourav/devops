@@ -16,6 +16,7 @@ x-frappe-image: &frappe-image
       awslogs-region: ${AWS_REGION}
       awslogs-group: ${CLOUDWATCH_LOG_GROUP:-/theiux/prod/containers}
       awslogs-stream: "${STACK_COLOR:-blue}-${COMPOSE_PROJECT_NAME:-theiux}"
+  stop_grace_period: 40s
 
 services:
   frappe:
@@ -35,6 +36,10 @@ services:
     environment:
       WORKER_PROCESSES: ${WORKER_PROCESSES:-2}
       WORKER_QUEUES: ${WORKER_QUEUES:-short,default,long}
+      ENABLE_DEDICATED_SITE_WORKERS: ${ENABLE_DEDICATED_SITE_WORKERS:-false}
+      DEDICATED_SITE_WORKERS: ${DEDICATED_SITE_WORKERS:-}
+      WORKER_SITE_ISOLATION_MODE: ${WORKER_SITE_ISOLATION_MODE:-shared}
+      TENANT_QUEUE_MODE: ${TENANT_QUEUE_MODE:-shared}
 
   scheduler:
     <<: *frappe-image
@@ -106,10 +111,12 @@ services:
       [
         "--character-set-server=utf8mb4",
         "--collation-server=utf8mb4_unicode_ci",
-        "--innodb-buffer-pool-size=512M",
+        "--innodb-buffer-pool-size=256M",
         "--innodb-log-file-size=128M",
-        "--max-connections=220",
+        "--max-connections=180",
         "--thread-cache-size=50"
+        ,"--max-user-connections=40"
+        ,"--max-statement-time=30"
       ]
     environment:
       MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
@@ -133,9 +140,9 @@ services:
       timeout: 5s
       retries: 10
 
-  redis:
+  redis-cache:
     image: redis:7-alpine
-    container_name: theiux-redis
+    container_name: theiux-redis-cache
     restart: unless-stopped
     command:
       [
@@ -145,9 +152,11 @@ services:
         "--appendonly",
         "no",
         "--maxmemory",
-        "512mb",
+        "384mb",
         "--maxmemory-policy",
-        "allkeys-lru"
+        "allkeys-lru",
+        "--latency-monitor-threshold",
+        "250"
       ]
     profiles: ["internal-redis"]
     networks:
@@ -157,7 +166,38 @@ services:
       options:
         awslogs-region: ${AWS_REGION}
         awslogs-group: ${CLOUDWATCH_LOG_GROUP:-/theiux/prod/containers}
-        awslogs-stream: redis
+        awslogs-stream: redis-cache
+
+  redis-queue:
+    image: redis:7-alpine
+    container_name: theiux-redis-queue
+    restart: unless-stopped
+    command:
+      [
+        "redis-server",
+        "--save",
+        "60",
+        "1000",
+        "--appendonly",
+        "yes",
+        "--appendfsync",
+        "everysec",
+        "--maxmemory",
+        "512mb",
+        "--maxmemory-policy",
+        "noeviction",
+        "--latency-monitor-threshold",
+        "250"
+      ]
+    profiles: ["internal-redis"]
+    networks:
+      - edge
+    logging:
+      driver: awslogs
+      options:
+        awslogs-region: ${AWS_REGION}
+        awslogs-group: ${CLOUDWATCH_LOG_GROUP:-/theiux/prod/containers}
+        awslogs-stream: redis-queue
 
 volumes:
   sites:

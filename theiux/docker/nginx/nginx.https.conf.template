@@ -1,0 +1,126 @@
+worker_processes auto;
+
+events {
+  worker_connections 2048;
+}
+
+http {
+  include /etc/nginx/mime.types;
+  default_type application/octet-stream;
+
+  log_format json_combined escape=json
+    '{"time":"$time_iso8601","host":"$host","remote_addr":"$remote_addr","request":"$request","status":$status,'
+    '"body_bytes_sent":$body_bytes_sent,"request_time":$request_time,"upstream_response_time":"$upstream_response_time",'
+    '"http_referer":"$http_referer","http_user_agent":"$http_user_agent"}';
+
+  access_log /var/log/nginx/access.log json_combined;
+  error_log /var/log/nginx/error.log warn;
+
+  sendfile on;
+  tcp_nopush on;
+  tcp_nodelay on;
+  keepalive_timeout 65;
+  server_tokens off;
+
+  map $http_upgrade $connection_upgrade {
+    default upgrade;
+    '' close;
+  }
+  limit_req_zone "$host:$binary_remote_addr" zone=site_per_ip:20m rate=${SITE_RATE_LIMIT_RPS}r/s;
+  limit_req_zone "$host:$binary_remote_addr" zone=site_api_per_ip:20m rate=${SITE_API_RATE_LIMIT_RPS}r/s;
+  limit_conn_zone "$host:$binary_remote_addr" zone=site_conn_per_ip:20m;
+
+  upstream frappe_backend {
+    server theiux-${ACTIVE_COLOR}-frappe:${FRAPPE_BACKEND_PORT};
+    keepalive 64;
+  }
+
+  upstream frappe_socketio {
+    server theiux-${ACTIVE_COLOR}-websocket:${FRAPPE_SOCKETIO_PORT};
+    keepalive 64;
+  }
+
+  server {
+    listen 80;
+    listen [::]:80;
+    server_name ${SITE_HOSTS};
+
+    location /.well-known/acme-challenge/ {
+      root /var/www/certbot;
+    }
+
+    location / {
+      return 301 https://$host$request_uri;
+    }
+  }
+
+  server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name ${SITE_HOSTS};
+
+    client_max_body_size ${CLIENT_MAX_BODY_SIZE};
+    limit_conn site_conn_per_ip ${SITE_CONN_LIMIT};
+
+    ssl_certificate /etc/letsencrypt/live/${PRIMARY_DOMAIN}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${PRIMARY_DOMAIN}/privkey.pem;
+    ssl_session_timeout 1d;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_tickets off;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers off;
+
+    add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+
+    location /assets/ {
+      alias /var/www/html/assets/;
+      expires 7d;
+      add_header Cache-Control "public, max-age=604800, immutable";
+      try_files $uri @backend;
+    }
+
+    location /files/ {
+      alias /var/www/html/files/;
+      expires 1d;
+      add_header Cache-Control "public, max-age=86400";
+      try_files $uri @backend;
+    }
+
+    location /socket.io {
+      limit_req zone=site_per_ip burst=${SITE_RATE_LIMIT_BURST} nodelay;
+      proxy_http_version 1.1;
+      proxy_set_header Upgrade $http_upgrade;
+      proxy_set_header Connection $connection_upgrade;
+      proxy_set_header Host $host;
+      proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+      proxy_set_header X-Forwarded-Proto $scheme;
+      proxy_read_timeout 600s;
+      proxy_send_timeout 600s;
+      proxy_pass http://frappe_socketio;
+    }
+
+    location @backend {
+      limit_req zone=site_per_ip burst=${SITE_RATE_LIMIT_BURST} nodelay;
+      proxy_http_version 1.1;
+      proxy_set_header Host $host;
+      proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+      proxy_set_header X-Forwarded-Proto $scheme;
+      proxy_set_header X-Use-X-Accel-Redirect True;
+      proxy_read_timeout 300s;
+      proxy_send_timeout 300s;
+      proxy_pass http://frappe_backend;
+    }
+
+    location / {
+      try_files $uri @backend;
+    }
+
+    location ~* ^/api/ {
+      limit_req zone=site_api_per_ip burst=${SITE_API_RATE_LIMIT_BURST} nodelay;
+      try_files $uri @backend;
+    }
+  }
+}

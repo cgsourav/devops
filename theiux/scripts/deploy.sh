@@ -9,18 +9,29 @@ if [ ! -f ".env" ]; then
   exit 1
 fi
 
+echo "Pre-deploy validation across all registered sites..."
+PROJECT_ROOT="${PROJECT_ROOT}" REQUIRE_ALL_HEALTHY=true scripts/site-health.sh summary
+
 NEW_IMAGE_TAG="${1:-}"
 if [ -z "${NEW_IMAGE_TAG}" ]; then
   echo "Usage: $0 <image_tag>" >&2
   exit 1
 fi
 
-ACTIVE_COLOR="$(awk -F= '/^ACTIVE_COLOR=/{print $2}' .env || true)"
-ACTIVE_COLOR="${ACTIVE_COLOR:-blue}"
-if [ "${ACTIVE_COLOR}" = "blue" ]; then
-  TARGET_COLOR="green"
-else
-  TARGET_COLOR="blue"
+memory_used_percent() {
+  total_kb="$(awk '/MemTotal/ {print $2}' /proc/meminfo)"
+  avail_kb="$(awk '/MemAvailable/ {print $2}' /proc/meminfo)"
+  used_kb=$((total_kb - avail_kb))
+  echo $((used_kb * 100 / total_kb))
+}
+
+MAX_DEPLOY_MEMORY_PERCENT="$(awk -F= '/^MAX_DEPLOY_MEMORY_PERCENT=/{print $2}' .env || true)"
+MAX_DEPLOY_MEMORY_PERCENT="${MAX_DEPLOY_MEMORY_PERCENT:-80}"
+
+current_mem="$(memory_used_percent)"
+if [ "${current_mem}" -ge "${MAX_DEPLOY_MEMORY_PERCENT}" ]; then
+  echo "Refusing deploy: memory at ${current_mem}% exceeds MAX_DEPLOY_MEMORY_PERCENT=${MAX_DEPLOY_MEMORY_PERCENT}%." >&2
+  exit 1
 fi
 
 old_tag="$(awk -F= '/^IMAGE_TAG=/{print $2}' .env || true)"
@@ -34,13 +45,16 @@ if [ -n "${old_tag}" ]; then
   echo "${old_tag}" > .previous_image_tag
 fi
 
-echo "Starting target color stack: ${TARGET_COLOR}"
-STACK_COLOR="${TARGET_COLOR}" docker compose -p "theiux-${TARGET_COLOR}" pull frappe worker scheduler websocket
-STACK_COLOR="${TARGET_COLOR}" docker compose -p "theiux-${TARGET_COLOR}" up -d --remove-orphans frappe worker scheduler websocket
+echo "Starting rolling application update..."
+docker compose pull frappe worker scheduler websocket
+for svc in worker scheduler websocket frappe; do
+  echo "Rolling update for ${svc}..."
+  docker compose up -d --no-deps "${svc}"
+done
 
 # Run migrations for every detected site (site_config.json present).
-echo "Running bench migrate on ${TARGET_COLOR} stack..."
-STACK_COLOR="${TARGET_COLOR}" docker compose -p "theiux-${TARGET_COLOR}" exec -T frappe bash -lc '
+echo "Running bench migrate on active stack..."
+docker compose exec -T frappe bash -lc '
 set -euo pipefail
 run_as_frappe() {
   if [ "$(id -u)" -eq 0 ]; then
@@ -66,30 +80,39 @@ if grep -q '^HEALTHCHECK_URL=' .env; then
   health_url="$(awk -F= '/^HEALTHCHECK_URL=/{print $2}' .env)"
 fi
 
-echo "Switching traffic to ${TARGET_COLOR} and validating health..."
-if grep -q '^ACTIVE_COLOR=' .env; then
-  sed -i "s/^ACTIVE_COLOR=.*/ACTIVE_COLOR=${TARGET_COLOR}/" .env
-else
-  echo "ACTIVE_COLOR=${TARGET_COLOR}" >> .env
-fi
+echo "Reloading edge and validating health..."
 docker compose up -d nginx certbot
+docker compose exec -T nginx sh -lc 'nginx -t && nginx -s reload' || true
 
 if ! curl -fsS --max-time 10 -H "Host: ${health_host}" "${health_url}" > /tmp/theiux-health.json; then
   echo "Deployment health check failed, initiating rollback..."
-  if grep -q '^ACTIVE_COLOR=' .env; then
-    sed -i "s/^ACTIVE_COLOR=.*/ACTIVE_COLOR=${ACTIVE_COLOR}/" .env
-  else
-    echo "ACTIVE_COLOR=${ACTIVE_COLOR}" >> .env
-  fi
-  docker compose up -d nginx certbot
-  STACK_COLOR="${TARGET_COLOR}" docker compose -p "theiux-${TARGET_COLOR}" down || true
   if [ -s ".previous_image_tag" ]; then
-    sed -i "s/^IMAGE_TAG=.*/IMAGE_TAG=$(cat .previous_image_tag)/" .env
+    rollback_tag="$(cat .previous_image_tag)"
+    sed -i "s/^IMAGE_TAG=.*/IMAGE_TAG=${rollback_tag}/" .env
+    docker compose pull frappe worker scheduler websocket
+    for svc in worker scheduler websocket frappe; do
+      docker compose up -d --no-deps "${svc}"
+    done
+    docker compose up -d nginx certbot
+    docker compose exec -T nginx sh -lc 'nginx -t && nginx -s reload' || true
   fi
   exit 1
 else
+  echo "Post-deploy full multi-tenant health verification..."
+  if ! PROJECT_ROOT="${PROJECT_ROOT}" REQUIRE_ALL_HEALTHY=true scripts/site-health.sh summary; then
+    echo "Post-deploy tenant health verification failed, initiating rollback..."
+    if [ -s ".previous_image_tag" ]; then
+      rollback_tag="$(cat .previous_image_tag)"
+      sed -i "s/^IMAGE_TAG=.*/IMAGE_TAG=${rollback_tag}/" .env
+      docker compose pull frappe worker scheduler websocket
+      for svc in worker scheduler websocket frappe; do
+        docker compose up -d --no-deps "${svc}"
+      done
+      docker compose up -d nginx certbot
+      docker compose exec -T nginx sh -lc 'nginx -t && nginx -s reload' || true
+    fi
+    exit 1
+  fi
   echo "${NEW_IMAGE_TAG}" > .last_successful_image_tag
-  echo "${TARGET_COLOR}" > .last_successful_color
-  STACK_COLOR="${ACTIVE_COLOR}" docker compose -p "theiux-${ACTIVE_COLOR}" down || true
   echo "Deployment succeeded with image tag ${NEW_IMAGE_TAG}"
 fi
