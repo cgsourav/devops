@@ -18,6 +18,17 @@ if [ -z "${NEW_IMAGE_TAG}" ]; then
   exit 1
 fi
 
+image_repo="$(awk -F= '/^FRAPPE_IMAGE_REPO=/{print $2}' .env || true)"
+if [[ "${image_repo}" == ghcr.io/* ]]; then
+  ghcr_user="$(awk -F= '/^GHCR_USERNAME=/{print $2}' .env || true)"
+  ghcr_token="$(awk -F= '/^GHCR_TOKEN=/{print $2}' .env || true)"
+  if [ -z "${ghcr_user}" ] || [ -z "${ghcr_token}" ]; then
+    echo "FRAPPE_IMAGE_REPO uses GHCR but GHCR_USERNAME/GHCR_TOKEN are missing in .env." >&2
+    exit 1
+  fi
+  printf '%s' "${ghcr_token}" | docker login ghcr.io -u "${ghcr_user}" --password-stdin >/dev/null
+fi
+
 memory_used_percent() {
   total_kb="$(awk '/MemTotal/ {print $2}' /proc/meminfo)"
   avail_kb="$(awk '/MemAvailable/ {print $2}' /proc/meminfo)"

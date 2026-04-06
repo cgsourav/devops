@@ -52,4 +52,12 @@ for key in APPS_TO_INSTALL DEFAULT_SITE DB_HOST DB_PORT REDIS_CACHE REDIS_QUEUE 
   fi
 done
 
+# Optional registry auth values.
+for key in GHCR_USERNAME GHCR_TOKEN; do
+  if aws ssm get-parameter --region "${AWS_REGION}" --with-decryption --name "${PARAMETER_PATH}/${key}" >/dev/null 2>&1; then
+    value="$(fetch_param "${key}")"
+    upsert_env "${key}" "${value}"
+  fi
+done
+
 echo "Rendered ${ENV_FILE} from SSM parameters under ${PARAMETER_PATH}"

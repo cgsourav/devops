@@ -2,18 +2,19 @@ name: Build and Deploy theiux
 
 on:
   push:
-    branches: ["stable"]
+    branches: ["main"]
   workflow_dispatch:
 
 env:
   AWS_REGION: ${{ vars.AWS_REGION }}
-  ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+  GHCR_IMAGE_REPO: ghcr.io/${{ github.repository_owner }}/theiux-frappe
 
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      packages: write
       id-token: write
 
     steps:
@@ -26,20 +27,22 @@ jobs:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Login to Amazon ECR
-        id: login-ecr
-        uses: aws-actions/amazon-ecr-login@v2
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push image
         id: build-image
         env:
-          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           IMAGE_TAG: ${{ github.sha }}
           APPS_JSON_BASE64_VAR: ${{ vars.APPS_JSON_BASE64 }}
           GITHUB_PAT: ${{ secrets.GH_APP_SOURCE_PAT }}
         run: |
           set -euo pipefail
-          IMAGE_URI="${REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+          IMAGE_URI="${GHCR_IMAGE_REPO}:${IMAGE_TAG}"
           APPS_JSON_B64=""
           if [ -f "apps.json" ]; then
             APPS_JSON_B64="$(base64 -w0 apps.json)"
@@ -61,14 +64,17 @@ jobs:
             --secret id=github_pat,env=GITHUB_PAT \
             -f docker/frappe/Dockerfile \
             -t "${IMAGE_URI}" \
+            -t "${GHCR_IMAGE_REPO}:main" \
             .
           echo "image_uri=${IMAGE_URI}" >> "$GITHUB_OUTPUT"
           echo "image_tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
 
-      - name: Update image repository parameter
+      - name: Update deploy parameters in SSM
         env:
           PARAMETER_PATH: ${{ vars.SSM_PARAMETER_PATH }}
-          FRAPPE_IMAGE_REPO: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}
+          FRAPPE_IMAGE_REPO: ${{ env.GHCR_IMAGE_REPO }}
+          GHCR_USERNAME: ${{ secrets.GHCR_USERNAME }}
+          GHCR_TOKEN: ${{ secrets.GHCR_READ_TOKEN }}
         run: |
           set -euo pipefail
           if [ -z "${PARAMETER_PATH}" ]; then
@@ -81,6 +87,20 @@ jobs:
             --type "String" \
             --overwrite \
             --value "${FRAPPE_IMAGE_REPO}" >/dev/null
+          if [ -n "${GHCR_USERNAME}" ] && [ -n "${GHCR_TOKEN}" ]; then
+            aws ssm put-parameter \
+              --region "${AWS_REGION}" \
+              --name "${PARAMETER_PATH}/GHCR_USERNAME" \
+              --type "SecureString" \
+              --overwrite \
+              --value "${GHCR_USERNAME}" >/dev/null
+            aws ssm put-parameter \
+              --region "${AWS_REGION}" \
+              --name "${PARAMETER_PATH}/GHCR_TOKEN" \
+              --type "SecureString" \
+              --overwrite \
+              --value "${GHCR_TOKEN}" >/dev/null
+          fi
 
       - name: Deploy to EC2
         env:
@@ -89,7 +109,7 @@ jobs:
           INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID }}
           PARAMETER_PATH: ${{ vars.SSM_PARAMETER_PATH }}
           DEPLOY_PATH: ${{ vars.EC2_DEPLOY_PATH }}
-          GIT_REF: ${{ github.ref_name }}
+          GIT_REF: main
         run: |
           set -euo pipefail
           if [ -z "${INSTANCE_ID}" ]; then

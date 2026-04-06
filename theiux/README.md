@@ -80,6 +80,34 @@
 ./bin/theiux destroy <app>
 ```
 
+## Local Run (GHCR + No CloudWatch Dependency)
+
+Use this when running on a local machine (not EC2). The default compose file uses `awslogs`, which requires AWS credentials/IMDS and can fail locally.
+
+1) Configure image source in `.env`:
+
+```bash
+FRAPPE_IMAGE_REPO=ghcr.io/cgsourav/theiux-frappe
+IMAGE_TAG=<exact_commit_sha>
+```
+
+2) Start with local override (disables `awslogs` only for local):
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.local.yml \
+  --profile internal-db --profile internal-redis up -d
+```
+
+3) Check status:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.local.yml ps
+```
+
+Notes:
+- `docker-compose.local.yml` switches logging driver to `json-file`; production `docker-compose.yml` remains unchanged.
+- Prefer immutable SHA tags for deterministic deploys.
+
 ### Tenant lifecycle (fully automated)
 
 ```bash

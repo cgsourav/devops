@@ -99,95 +99,178 @@ export default function HomePage() {
     }
   }
 
-  return (
-    <div className="container grid" style={{ gap: 24, maxWidth: 520 }}>
-      <h1 style={{ marginBottom: 0 }}>Theiux Control Plane</h1>
-      <p className="muted" style={{ fontSize: 15, margin: 0 }}>
-        Sign in to manage <Link href="/benches">benches and sites</Link>, and deployments. Use the{' '}
-        <Link href="/deploy">deploy wizard</Link> for full-site pipelines (requires an active session).
-      </p>
+  const trustItems = ['S3 + CloudFront', 'ACM TLS', 'IAM least privilege', 'Audit-friendly logs']
+  const features = [
+    {
+      eyebrow: '01',
+      title: 'Deploy Pipelines',
+      copy: 'Run consistent full-site deployment flows with clear lifecycle visibility from build to release.',
+    },
+    {
+      eyebrow: '02',
+      title: 'Multi-site Ops',
+      copy: 'Operate benches, sites, and environments from one control plane with less switching and fewer mistakes.',
+    },
+    {
+      eyebrow: '03',
+      title: 'Team Access',
+      copy: 'Manage team access and secure sessions with operational defaults that are production-friendly.',
+    },
+  ]
 
-      <div className="card grid" style={{ maxWidth: 480 }} role="form" aria-busy={authBusy}>
-        <div className="row" style={{ gap: 8 }}>
-          <button
-            type="button"
-            className={authMode === 'login' ? 'btn' : 'btn secondary'}
-            disabled={authBusy}
-            onClick={() => {
-              setAuthMode('login')
-              setErr('')
-            }}
-          >
-            Sign in
-          </button>
-          <button
-            type="button"
-            className={authMode === 'register' ? 'btn' : 'btn secondary'}
-            disabled={authBusy}
-            onClick={() => {
-              setAuthMode('register')
-              setErr('')
-            }}
-          >
-            Create account
-          </button>
-        </div>
-        <label className="muted" style={{ fontSize: 12 }}>
-          Email
-          <input
-            className="input"
-            name="email"
-            type="email"
-            autoComplete="email"
-            value={email}
-            onChange={(e) => setEmail(e.target.value)}
-            disabled={authBusy}
-          />
-        </label>
-        <label className="muted" style={{ fontSize: 12 }}>
-          Password
-          <input
-            className="input"
-            name="password"
-            type="password"
-            autoComplete={authMode === 'login' ? 'current-password' : 'new-password'}
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
-            disabled={authBusy}
-          />
-        </label>
-        {authMode === 'register' && (
-          <label className="muted" style={{ fontSize: 12 }}>
-            Confirm password
-            <input
-              className="input"
-              name="confirmPassword"
-              type="password"
-              autoComplete="new-password"
-              value={confirmPassword}
-              onChange={(e) => setConfirmPassword(e.target.value)}
-              disabled={authBusy}
-            />
-          </label>
-        )}
-        {err && (
-          <p role="alert" style={{ color: 'var(--err, #b00020)', fontSize: 14, margin: 0 }}>
-            {err}
-          </p>
-        )}
-        {authMode === 'login' ? (
-          <button type="button" className="btn" disabled={authBusy} onClick={() => runLogin()}>
-            {authBusy ? 'Signing in…' : 'Sign in'}
-          </button>
-        ) : (
-          <button type="button" className="btn" disabled={authBusy} onClick={() => runRegister()}>
-            {authBusy ? 'Working…' : 'Create account and sign in'}
-          </button>
-        )}
-        <p className="muted" style={{ fontSize: 13 }}>
-          Bearer tokens are stored in this browser. If the API sets cookies, mutating requests send <code>X-CSRF-Token</code>.
-        </p>
+  return (
+    <main className="landing-page">
+      <div className="landing-noise" aria-hidden="true" />
+      <div className="landing-shell">
+        <header className="landing-nav">
+          <div className="landing-brand">Theiux Control Plane</div>
+          <nav className="landing-nav__links" aria-label="Primary navigation">
+            <Link href="/deploy">Deploy</Link>
+            <Link href="/dashboard">Dashboard</Link>
+            <Link href="/sites">Sites</Link>
+          </nav>
+          <span className="landing-status">Platform status: Operational</span>
+        </header>
+
+        <section className="landing-hero">
+          <div className="landing-hero__content">
+            <p className="landing-kicker">SaaS DevOps Control Plane</p>
+            <h1 className="landing-title">Ship and Operate Frappe Stacks with Confidence</h1>
+            <p className="landing-subtitle">
+              Orchestration, environments, and deployments from one control plane built for secure, repeatable delivery.
+            </p>
+            <div className="landing-cta-row">
+              <Link className="btn-link landing-cta-primary" href="/deploy">
+                Open Deploy Wizard
+              </Link>
+              <Link className="btn-link landing-cta-secondary" href="/dashboard">
+                View Dashboard
+              </Link>
+            </div>
+            <ul className="landing-bullets">
+              <li>Full lifecycle management</li>
+              <li>Auto-scaling and health checks</li>
+              <li>Integrated monitoring and release confidence</li>
+            </ul>
+            <div className="landing-trust" role="list" aria-label="Security and platform trust">
+              {trustItems.map((item) => (
+                <span key={item} role="listitem" className="landing-trust__item">
+                  {item}
+                </span>
+              ))}
+            </div>
+          </div>
+
+          <section className="auth-card card grid" role="form" aria-busy={authBusy} aria-labelledby="auth-title">
+            <div className="auth-header">
+              <h2 id="auth-title" className="auth-title">
+                Welcome back
+              </h2>
+              <p className="auth-subtitle muted">Access your benches, sites, and deployment pipelines.</p>
+            </div>
+            <div className="auth-mode-toggle row">
+              <button
+                type="button"
+                className={authMode === 'login' ? 'btn auth-mode-toggle__button--active' : 'btn secondary'}
+                disabled={authBusy}
+                onClick={() => {
+                  setAuthMode('login')
+                  setErr('')
+                }}
+              >
+                Sign in
+              </button>
+              <button
+                type="button"
+                className={authMode === 'register' ? 'btn' : 'btn secondary'}
+                disabled={authBusy}
+                onClick={() => {
+                  setAuthMode('register')
+                  setErr('')
+                }}
+              >
+                Create account
+              </button>
+            </div>
+            <label className="field auth-field">
+              <span className="field-label">Email</span>
+              <input
+                className="input"
+                name="email"
+                type="email"
+                autoComplete="email"
+                placeholder="you@company.com"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                disabled={authBusy}
+              />
+            </label>
+            <label className="field auth-field">
+              <span className="field-label">Password</span>
+              <input
+                className="input"
+                name="password"
+                type="password"
+                autoComplete={authMode === 'login' ? 'current-password' : 'new-password'}
+                placeholder="Minimum 8 characters"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                disabled={authBusy}
+              />
+            </label>
+            {authMode === 'register' && (
+              <label className="field auth-field">
+                <span className="field-label">Confirm password</span>
+                <input
+                  className="input"
+                  name="confirmPassword"
+                  type="password"
+                  autoComplete="new-password"
+                  placeholder="Re-enter your password"
+                  value={confirmPassword}
+                  onChange={(e) => setConfirmPassword(e.target.value)}
+                  disabled={authBusy}
+                />
+              </label>
+            )}
+            {err && (
+              <p role="alert" className="auth-error">
+                {err}
+              </p>
+            )}
+            {authMode === 'login' ? (
+              <button type="button" className="btn auth-submit" disabled={authBusy} onClick={() => runLogin()}>
+                {authBusy ? 'Signing in…' : 'Sign in'}
+              </button>
+            ) : (
+              <button type="button" className="btn auth-submit" disabled={authBusy} onClick={() => runRegister()}>
+                {authBusy ? 'Working…' : 'Create account and sign in'}
+              </button>
+            )}
+            <p className="auth-footnote muted">
+              Bearer tokens are stored in this browser. If API cookies exist, mutating requests send <code>X-CSRF-Token</code>.
+            </p>
+          </section>
+        </section>
+
+        <section className="landing-features" aria-label="Platform features">
+          {features.map((feature) => (
+            <article key={feature.title} className="landing-feature card">
+              <span className="landing-feature__eyebrow">{feature.eyebrow}</span>
+              <h3>{feature.title}</h3>
+              <p className="muted">{feature.copy}</p>
+            </article>
+          ))}
+        </section>
+
+        <footer className="landing-footer muted">
+          <span>© {new Date().getFullYear()} Theiux</span>
+          <span>Privacy</span>
+          <span>Terms</span>
+          <span>Security</span>
+          <span>Status</span>
+        </footer>
       </div>
-    </div>
+    </main>
   )
 }
