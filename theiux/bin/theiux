@@ -198,6 +198,22 @@ PY
 case "${command}" in
   init)
     terraform -chdir="${TERRAFORM_DIR}" init -input=false
+    # Idempotency hardening: if the CloudWatch log group already exists outside state,
+    # import it before apply so init does not fail with ResourceAlreadyExistsException.
+    PROJECT_NAME="${TF_VAR_project_name:-theiux}"
+    ENVIRONMENT="${TF_VAR_environment:-prod}"
+    LOG_GROUP_NAME="/${PROJECT_NAME}/${ENVIRONMENT}/containers"
+    AWS_REGION_FOR_IMPORT="${TF_VAR_aws_region:-${AWS_REGION:-}}"
+    if [ -n "${AWS_REGION_FOR_IMPORT}" ]; then
+      if aws logs describe-log-groups \
+        --region "${AWS_REGION_FOR_IMPORT}" \
+        --log-group-name-prefix "${LOG_GROUP_NAME}" \
+        --query "logGroups[?logGroupName=='${LOG_GROUP_NAME}'].logGroupName | [0]" \
+        --output text 2>/dev/null | grep -qx "${LOG_GROUP_NAME}"; then
+        echo "[theiux] Found existing CloudWatch log group: ${LOG_GROUP_NAME}. Importing into Terraform state..."
+        terraform -chdir="${TERRAFORM_DIR}" import -input=false aws_cloudwatch_log_group.app "${LOG_GROUP_NAME}" >/dev/null 2>&1 || true
+      fi
+    fi
     terraform -chdir="${TERRAFORM_DIR}" apply -auto-approve -input=false
     cat > "${CTX_FILE}" <<EOF
 AWS_REGION=$(terraform_output aws_region)

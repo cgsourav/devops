@@ -46,7 +46,22 @@ export async function apiFetch<T>(path: string, init: RequestInit = {}, token?: 
   }
   const p = path.startsWith('/') ? path : `/${path}`
   const v1Path = p.startsWith('/v1') ? p : `/v1${p}`
-  const res = await fetch(`${API}${v1Path}`, { ...init, headers, cache: 'no-store' })
+  const endpoint = `${API}${v1Path}`
+  let res: Response
+  try {
+    res = await fetch(endpoint, { ...init, headers, cache: 'no-store' })
+  } catch (e) {
+    const msg =
+      e instanceof Error
+        ? e.message
+        : 'Request failed before reaching the API'
+    throw new ApiError(
+      `Network error reaching API at ${API}. Verify backend is running and NEXT_PUBLIC_API_BASE_URL is correct. (${msg})`,
+      0,
+      'network_error',
+      { endpoint }
+    )
+  }
   const text = await res.text()
   let data: unknown
   try {

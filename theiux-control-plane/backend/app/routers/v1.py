@@ -9,6 +9,8 @@ import secrets
 import shutil
 import subprocess
 import time
+import threading
+import uuid
 from pathlib import Path
 from urllib.parse import urlparse
 from collections import defaultdict, deque
@@ -72,6 +74,8 @@ from app.schemas import (
     RegisterOut,
     TheiuxInitIn,
     TheiuxInitOut,
+    TheiuxInitStartOut,
+    TheiuxInitStatusOut,
     TeamInviteIn,
     TeamInviteOut,
     TeamMemberOut,
@@ -88,6 +92,8 @@ router.include_router(benches_routes.router)
 router.include_router(sites_routes.router)
 
 _rate_limits: defaultdict[str, deque[float]] = defaultdict(deque)
+_init_jobs: dict[str, dict] = {}
+_init_jobs_lock = threading.Lock()
 
 
 def _enforce_auth_rate_limit(request: Request) -> None:
@@ -328,6 +334,96 @@ def _run_theiux_init_subprocess(payload: TheiuxInitIn) -> tuple[int, str, str]:
         return -1, out, err
 
 
+def _append_init_log(job_id: str, line: str) -> None:
+    with _init_jobs_lock:
+        j = _init_jobs.get(job_id)
+        if not j:
+            return
+        logs = j.setdefault('logs', [])
+        logs.append(line.rstrip('\n'))
+        if len(logs) > 5000:
+            del logs[: len(logs) - 5000]
+
+
+def _run_theiux_init_streaming(job_id: str, payload: TheiuxInitIn) -> None:
+    with _init_jobs_lock:
+        j = _init_jobs.get(job_id)
+        if not j:
+            return
+        j['status'] = 'running'
+        j['started_at'] = datetime.now(timezone.utc).isoformat()
+
+    cli = Path(settings.theiux_cli_path)
+    if not cli.is_file():
+        with _init_jobs_lock:
+            j = _init_jobs.get(job_id)
+            if j:
+                j['status'] = 'failed'
+                j['finished_at'] = datetime.now(timezone.utc).isoformat()
+                j['exit_code'] = -1
+                j['ok'] = False
+                j['stderr'] = f'theiux CLI not found at {cli}'
+        return
+
+    env = _env_for_theiux_init(payload)
+    root = cli.resolve().parent.parent
+    stdout_lines: list[str] = []
+    stderr_lines: list[str] = []
+    try:
+        proc = subprocess.Popen(
+            [str(cli), 'init'],
+            cwd=str(root),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+    except Exception as exc:
+        with _init_jobs_lock:
+            j = _init_jobs.get(job_id)
+            if j:
+                j['status'] = 'failed'
+                j['finished_at'] = datetime.now(timezone.utc).isoformat()
+                j['exit_code'] = -1
+                j['ok'] = False
+                j['stderr'] = str(exc)
+        return
+
+    def _read_stream(stream, sink: list[str], prefix: str) -> None:
+        if not stream:
+            return
+        for line in stream:
+            sink.append(line)
+            _append_init_log(job_id, f'[{prefix}] {line.rstrip()}')
+
+    t_out = threading.Thread(target=_read_stream, args=(proc.stdout, stdout_lines, 'stdout'), daemon=True)
+    t_err = threading.Thread(target=_read_stream, args=(proc.stderr, stderr_lines, 'stderr'), daemon=True)
+    t_out.start()
+    t_err.start()
+    t_out.join(timeout=settings.theiux_init_timeout_seconds + 30)
+    t_err.join(timeout=settings.theiux_init_timeout_seconds + 30)
+    try:
+        rc = proc.wait(timeout=settings.theiux_init_timeout_seconds)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        rc = -1
+        stderr_lines.append(f'[timeout after {settings.theiux_init_timeout_seconds}s]\n')
+        _append_init_log(job_id, f'[stderr] [timeout after {settings.theiux_init_timeout_seconds}s]')
+
+    out = ''.join(stdout_lines)
+    err = ''.join(stderr_lines)
+    with _init_jobs_lock:
+        j = _init_jobs.get(job_id)
+        if j:
+            j['status'] = 'finished'
+            j['finished_at'] = datetime.now(timezone.utc).isoformat()
+            j['exit_code'] = rc
+            j['ok'] = rc == 0
+            j['stdout'] = out
+            j['stderr'] = err
+
+
 @router.get('/me', response_model=UserMeOut, tags=['auth'])
 def read_current_user(user: User = Depends(current_user)) -> UserMeOut:
     return UserMeOut(id=user.id, email=user.email, role=user.role or 'viewer', default_org_id=user.default_org_id)
@@ -372,6 +468,66 @@ async def admin_theiux_init(
     )
     db.commit()
     return TheiuxInitOut(ok=ok, exit_code=exit_code, stdout=out, stderr=err)
+
+
+@router.post('/admin/theiux-init/start', response_model=TheiuxInitStartOut, tags=['admin'])
+async def admin_theiux_init_start(
+    payload: TheiuxInitIn,
+    _: Session = Depends(get_db),
+    user: User = Depends(require_min_role('admin')),
+) -> TheiuxInitStartOut:
+    job_id = str(uuid.uuid4())
+    with _init_jobs_lock:
+        _init_jobs[job_id] = {
+            'job_id': job_id,
+            'user_id': user.id,
+            'status': 'queued',
+            'started_at': None,
+            'finished_at': None,
+            'exit_code': None,
+            'ok': None,
+            'logs': [],
+            'stdout': '',
+            'stderr': '',
+            'audited': False,
+        }
+    threading.Thread(target=_run_theiux_init_streaming, args=(job_id, payload), daemon=True).start()
+    return TheiuxInitStartOut(job_id=job_id, status='queued')
+
+
+@router.get('/admin/theiux-init/{job_id}', response_model=TheiuxInitStatusOut, tags=['admin'])
+def admin_theiux_init_status(
+    job_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_min_role('admin')),
+) -> TheiuxInitStatusOut:
+    with _init_jobs_lock:
+        j = _init_jobs.get(job_id)
+        if not j or j.get('user_id') != user.id:
+            raise_api_error(status_code=404, code='init_job_not_found', message='init job not found', category='client_error')
+        out = TheiuxInitStatusOut(
+            job_id=j['job_id'],
+            status=j.get('status', 'unknown'),
+            started_at=j.get('started_at'),
+            finished_at=j.get('finished_at'),
+            exit_code=j.get('exit_code'),
+            ok=j.get('ok'),
+            logs=list(j.get('logs', []))[-200:],
+            stdout=j.get('stdout', ''),
+            stderr=j.get('stderr', ''),
+        )
+        if j.get('status') == 'finished' and not j.get('audited'):
+            write_audit(
+                db,
+                user_id=user.id,
+                action='theiux_init',
+                resource_type='platform',
+                resource_id=None,
+                metadata={'exit_code': j.get('exit_code'), 'ok': bool(j.get('ok'))},
+            )
+            db.commit()
+            j['audited'] = True
+        return out
 
 
 @router.get('/plans', response_model=list[PlanOut], tags=['plans'])
