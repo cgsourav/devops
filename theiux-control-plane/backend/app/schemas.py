@@ -134,6 +134,14 @@ class TheiuxInitStatusOut(BaseModel):
     stderr: str = ''
 
 
+class TheiuxInitStateOut(BaseModel):
+    context_file_exists: bool
+    context_file_path: str
+    last_success_at: str | None = None
+    last_success_exit_code: int | None = None
+    is_initialized: bool
+
+
 # --- Plans & apps ---
 
 
