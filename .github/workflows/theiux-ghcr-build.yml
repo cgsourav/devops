@@ -6,6 +6,7 @@ on:
     paths:
       - "theiux/**"
       - ".github/workflows/theiux-ghcr-build.yml"
+      - "!theiux/README.md"
   workflow_dispatch:
 
 permissions:
