@@ -501,41 +501,6 @@ async def admin_theiux_init_start(
     return TheiuxInitStartOut(job_id=job_id, status='queued')
 
 
-@router.get('/admin/theiux-init/{job_id}', response_model=TheiuxInitStatusOut, tags=['admin'])
-def admin_theiux_init_status(
-    job_id: str,
-    db: Session = Depends(get_db),
-    user: User = Depends(require_min_role('admin')),
-) -> TheiuxInitStatusOut:
-    with _init_jobs_lock:
-        j = _init_jobs.get(job_id)
-        if not j or j.get('user_id') != user.id:
-            raise_api_error(status_code=404, code='init_job_not_found', message='init job not found', category='client_error')
-        out = TheiuxInitStatusOut(
-            job_id=j['job_id'],
-            status=j.get('status', 'unknown'),
-            started_at=j.get('started_at'),
-            finished_at=j.get('finished_at'),
-            exit_code=j.get('exit_code'),
-            ok=j.get('ok'),
-            logs=list(j.get('logs', []))[-200:],
-            stdout=j.get('stdout', ''),
-            stderr=j.get('stderr', ''),
-        )
-        if j.get('status') == 'finished' and not j.get('audited'):
-            write_audit(
-                db,
-                user_id=user.id,
-                action='theiux_init',
-                resource_type='platform',
-                resource_id=None,
-                metadata={'exit_code': j.get('exit_code'), 'ok': bool(j.get('ok'))},
-            )
-            db.commit()
-            j['audited'] = True
-        return out
-
-
 @router.get('/admin/theiux-init/state', response_model=TheiuxInitStateOut, tags=['admin'])
 def admin_theiux_init_state(
     db: Session = Depends(get_db),
@@ -574,6 +539,41 @@ def admin_theiux_init_state(
         last_success_exit_code=last_success_exit_code,
         is_initialized=context_exists,
     )
+
+
+@router.get('/admin/theiux-init/{job_id}', response_model=TheiuxInitStatusOut, tags=['admin'])
+def admin_theiux_init_status(
+    job_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_min_role('admin')),
+) -> TheiuxInitStatusOut:
+    with _init_jobs_lock:
+        j = _init_jobs.get(job_id)
+        if not j or j.get('user_id') != user.id:
+            raise_api_error(status_code=404, code='init_job_not_found', message='init job not found', category='client_error')
+        out = TheiuxInitStatusOut(
+            job_id=j['job_id'],
+            status=j.get('status', 'unknown'),
+            started_at=j.get('started_at'),
+            finished_at=j.get('finished_at'),
+            exit_code=j.get('exit_code'),
+            ok=j.get('ok'),
+            logs=list(j.get('logs', []))[-200:],
+            stdout=j.get('stdout', ''),
+            stderr=j.get('stderr', ''),
+        )
+        if j.get('status') == 'finished' and not j.get('audited'):
+            write_audit(
+                db,
+                user_id=user.id,
+                action='theiux_init',
+                resource_type='platform',
+                resource_id=None,
+                metadata={'exit_code': j.get('exit_code'), 'ok': bool(j.get('ok'))},
+            )
+            db.commit()
+            j['audited'] = True
+        return out
 
 
 @router.get('/plans', response_model=list[PlanOut], tags=['plans'])
