@@ -5,7 +5,7 @@ PROJECT_ROOT="${PROJECT_ROOT:-/opt/theiux}"
 AWS_REGION="${AWS_REGION:-us-east-1}"
 PARAMETER_PATH="${PARAMETER_PATH:-/theiux/prod}"
 IMAGE_TAG="${1:-}"
-GIT_REF="${GIT_REF:-stable}"
+GIT_REF="${GIT_REF:-main}"
 
 if [ -z "${IMAGE_TAG}" ]; then
   echo "Usage: $0 <image_tag>" >&2

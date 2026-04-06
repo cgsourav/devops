@@ -1,0 +1,28 @@
+services:
+  frappe:
+    logging:
+      driver: json-file
+  worker:
+    logging:
+      driver: json-file
+  scheduler:
+    logging:
+      driver: json-file
+  websocket:
+    logging:
+      driver: json-file
+  nginx:
+    logging:
+      driver: json-file
+  certbot:
+    logging:
+      driver: json-file
+  mariadb:
+    logging:
+      driver: json-file
+  redis-cache:
+    logging:
+      driver: json-file
+  redis-queue:
+    logging:
+      driver: json-file
