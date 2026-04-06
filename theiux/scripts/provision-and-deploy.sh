@@ -178,6 +178,7 @@ if ! aws iam get-role --role-name "${ROLE_NAME}" >/dev/null 2>&1; then
   run_cmd "aws iam attach-role-policy --role-name \"${ROLE_NAME}\" --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore >/dev/null"
   run_cmd "aws iam attach-role-policy --role-name \"${ROLE_NAME}\" --policy-arn arn:aws:iam::aws:policy/AmazonS3FullAccess >/dev/null"
   run_cmd "aws iam attach-role-policy --role-name \"${ROLE_NAME}\" --policy-arn arn:aws:iam::aws:policy/AmazonEC2FullAccess >/dev/null"
+  run_cmd "aws iam attach-role-policy --role-name \"${ROLE_NAME}\" --policy-arn arn:aws:iam::aws:policy/AmazonRoute53FullAccess >/dev/null"
 fi
 
 if ! aws iam get-instance-profile --instance-profile-name "${INSTANCE_PROFILE_NAME}" >/dev/null 2>&1; then
@@ -346,27 +347,6 @@ if [ "${RUN_EIP_SETUP:-false}" = "true" ]; then
   fi
 fi
 
-if [ -n "${HOSTED_ZONE_ID:-}" ] && [ -n "${DOMAIN_NAME:-}" ]; then
-  R53_JSON="$(mktemp)"
-  cat > "${R53_JSON}" <<JSON
-{
-  "Comment": "theiux automated DNS update",
-  "Changes": [
-    {
-      "Action": "UPSERT",
-      "ResourceRecordSet": {
-        "Name": "${DOMAIN_NAME}",
-        "Type": "A",
-        "TTL": 60,
-        "ResourceRecords": [{ "Value": "${PUBLIC_IP}" }]
-      }
-    }
-  ]
-}
-JSON
-  run_cmd "aws route53 change-resource-record-sets --hosted-zone-id \"${HOSTED_ZONE_ID}\" --change-batch \"file://${R53_JSON}\" >/dev/null"
-fi
-
 if [ "${DRY_RUN}" != "true" ]; then
 cat > "${STATE_FILE}" <<JSON
 {
@@ -387,6 +367,13 @@ cat > "${STATE_FILE}" <<JSON
   "deploy_path": "${DEPLOY_PATH}"
 }
 JSON
+fi
+
+if [ "${AUTO_ROUTE53_DNS:-true}" = "true" ] && [ -n "${DOMAIN_NAME:-}" ] && [ "${DRY_RUN}" != "true" ]; then
+  echo "Updating Route53 A records for ${DOMAIN_NAME} -> ${PUBLIC_IP}..."
+  DOMAIN_NAME="${DOMAIN_NAME}" CREATE_WWW_RECORD="${CREATE_WWW_RECORD:-true}" AUTO_ROUTE53_DNS="${AUTO_ROUTE53_DNS:-true}" \
+    HOSTED_ZONE_ID="${HOSTED_ZONE_ID:-}" \
+    bash "${PROJECT_ROOT}/scripts/route53-sync-dns.sh" --ip "${PUBLIC_IP}" || echo "WARN: Route53 sync failed (non-fatal)." >&2
 fi
 
 echo "Waiting for cloud-init and service health..."

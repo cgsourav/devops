@@ -244,7 +244,7 @@ theiux/
 
 ## End-to-End Flow
 
-1. Developer pushes code to `main`.
+1. Developer pushes code to `stable`.
 2. GitHub Actions builds image and pushes to ECR.
 3. Workflow sends SSM Run Command to EC2 (no SSH).
 4. Instance pulls latest code, renders `.env` from Parameter Store, and deploys.
@@ -552,7 +552,7 @@ Script behavior:
 
 ## 6) CI/CD (GitHub Actions)
 
-On push to `main`:
+On push to `stable`:
 1. Build image with dynamic build args (`PYTHON_VERSION`, `NODE_VERSION`, `WKHTMLTOPDF_VERSION`)
 2. Push to ECR tagged with commit SHA
 3. SSH to EC2
@@ -570,7 +570,7 @@ Required repository variables/secrets:
   - `PYTHON_VERSION`
   - `NODE_VERSION`
   - `WKHTMLTOPDF_VERSION`
-  - `APPS_JSON_BASE64` (optional: base64-encoded apps manifest)
+  - `APPS_JSON_BASE64` (optional fallback when `apps.json` is not committed)
 - **Secrets**
   - `AWS_ROLE_ARN`
   - `EC2_HOST`
@@ -651,7 +651,9 @@ Recommended cron:
 ## Dynamic Frappe/App Versioning
 
 - `FRAPPE_GIT_URL` and `FRAPPE_VERSION` let you pin Frappe to any upstream and ref (branch/tag/commit).
-- `APPS_JSON_BASE64` is consumed at build-time in CI to bake apps into the image (immutable deploy). Generate from `apps.json`:
+- `apps.json` (committed in repo root) is consumed at build-time in CI to bake apps into the image (immutable deploy).
+- If `apps.json` is absent, CI falls back to `APPS_JSON_BASE64`.
+- Generate `APPS_JSON_BASE64` from `apps.json` when needed:
 
 ```bash
 base64 -w0 apps.json
