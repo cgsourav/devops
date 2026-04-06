@@ -1,0 +1,74 @@
+name: Theiux Control Plane CI
+
+on:
+  pull_request:
+    branches: ["main"]
+    paths:
+      - "theiux-control-plane/**"
+      - ".github/workflows/theiux-control-plane-ci.yml"
+  push:
+    branches: ["main", "feature/**"]
+    paths:
+      - "theiux-control-plane/**"
+      - ".github/workflows/theiux-control-plane-ci.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: control-plane-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend-tests:
+    name: Backend tests (pytest)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: theiux-control-plane/backend
+    env:
+      DATABASE_URL: postgresql+psycopg://postgres:postgres@127.0.0.1:5432/theiux
+      REDIS_URL: redis://127.0.0.1:6379/0
+      JWT_SECRET: ci-jwt-secret
+      THEIUX_CLI_PATH: /usr/bin/echo
+      ALLOWED_RUNTIME_VERSIONS: "python:3.11,node:20,go:1.22,ruby:3.3"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: theiux-control-plane/backend/requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest
+
+      - name: Run tests
+        run: pytest -q
+
+  frontend-build:
+    name: Frontend build (Next.js)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: theiux-control-plane/frontend
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: theiux-control-plane/frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build app
+        run: npm run build

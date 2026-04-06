@@ -1,0 +1,22 @@
+# Dependencies and build output (reinstalled / generated in the image)
+node_modules
+.next
+out
+dist
+.turbo
+
+# Env (use build args or runtime env_file in Compose, not image layers)
+.env
+.env.*
+!.env.example
+
+# VCS and IDE
+.git
+.gitignore
+.cursor
+.vscode
+*.md
+
+# Logs and OS noise
+npm-debug.log*
+.DS_Store

@@ -120,6 +120,7 @@ if [ -n "${ROLE_NAME}" ]; then
   run_cmd "aws iam detach-role-policy --role-name \"${ROLE_NAME}\" --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore >/dev/null 2>&1 || true"
   run_cmd "aws iam detach-role-policy --role-name \"${ROLE_NAME}\" --policy-arn arn:aws:iam::aws:policy/AmazonS3FullAccess >/dev/null 2>&1 || true"
   run_cmd "aws iam detach-role-policy --role-name \"${ROLE_NAME}\" --policy-arn arn:aws:iam::aws:policy/AmazonEC2FullAccess >/dev/null 2>&1 || true"
+  run_cmd "aws iam detach-role-policy --role-name \"${ROLE_NAME}\" --policy-arn arn:aws:iam::aws:policy/AmazonRoute53FullAccess >/dev/null 2>&1 || true"
   run_cmd "aws iam delete-role --role-name \"${ROLE_NAME}\" >/dev/null 2>&1 || true"
 fi
 

@@ -34,6 +34,32 @@ if [ "${current_mem}" -ge "${MAX_DEPLOY_MEMORY_PERCENT}" ]; then
   exit 1
 fi
 
+echo "Pre-deploy backup checkpoint (bench backup --with-files) across all sites..."
+docker compose exec -T frappe bash -lc '
+set -euo pipefail
+run_as_frappe() {
+  if [ "$(id -u)" -eq 0 ]; then
+    gosu "${FRAPPE_USER:-frappe}" "$@"
+  else
+    "$@"
+  fi
+}
+cd "${BENCH_DIR:-/home/frappe/frappe-bench}"
+site_count=0
+for d in sites/*; do
+  site="$(basename "$d")"
+  if [ -f "sites/${site}/site_config.json" ]; then
+    site_count=$((site_count + 1))
+    echo "Backing up ${site} (--with-files)"
+    run_as_frappe bench --site "${site}" backup --with-files
+  fi
+done
+if [ "${site_count}" -eq 0 ]; then
+  echo "No sites detected for backup checkpoint."
+fi
+'
+echo "Pre-deploy backup checkpoint completed."
+
 old_tag="$(awk -F= '/^IMAGE_TAG=/{print $2}' .env || true)"
 if grep -q '^IMAGE_TAG=' .env; then
   sed -i "s/^IMAGE_TAG=.*/IMAGE_TAG=${NEW_IMAGE_TAG}/" .env
@@ -114,5 +140,9 @@ else
     exit 1
   fi
   echo "${NEW_IMAGE_TAG}" > .last_successful_image_tag
+  if [ -f "${PROJECT_ROOT}/.aws-provision-state.json" ]; then
+    echo "Route53 DNS sync (automated)..."
+    bash "${PROJECT_ROOT}/scripts/route53-sync-dns.sh" || true
+  fi
   echo "Deployment succeeded with image tag ${NEW_IMAGE_TAG}"
 fi

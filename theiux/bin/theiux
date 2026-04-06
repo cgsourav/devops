@@ -15,7 +15,12 @@ Usage:
   theiux deploy <app>
   theiux rollback <app>
   theiux destroy <app>
-  theiux deploy-site --domain <domain> [--apps app1,app2]
+  theiux deploy-site --domain <domain> [--apps app1,app2] [--git-repo <url>] [--runtime <name>] [--runtime-version <ver>]
+  theiux inventory-bench
+  theiux inventory-site --domain <domain>
+  theiux get-app-only --git-repo <url> [--branch <name>]
+  theiux install-app-on-site --domain <d> --app <name> [--git-repo <url>]
+  theiux uninstall-app-from-site --domain <d> --app <name>
   theiux list-sites
   theiux remove-site --domain <domain> [--drop-db]
   theiux health [site <domain>]
@@ -37,23 +42,163 @@ terraform_output() {
   terraform -chdir="${TERRAFORM_DIR}" output -raw "$1"
 }
 
+# Poll get-command-invocation until terminal Status or local wall-clock limit (default 1h).
+# Override: THEIUX_SSM_WAIT_MAX_SECONDS, THEIUX_SSM_POLL_SECONDS.
 wait_ssm() {
   local command_id="$1"
   local instance_id="$2"
   local region="$3"
-  aws ssm wait command-executed --region "${region}" --command-id "${command_id}" --instance-id "${instance_id}"
-  aws ssm get-command-invocation \
-    --region "${region}" \
-    --command-id "${command_id}" \
-    --instance-id "${instance_id}" \
-    --query '{Status:Status,Stdout:StandardOutputContent,Stderr:StandardErrorContent}' \
-    --output json
+  local max_wait_sec="${THEIUX_SSM_WAIT_MAX_SECONDS:-3600}"
+  local poll_sec="${THEIUX_SSM_POLL_SECONDS:-15}"
+  local start
+  start="$(date +%s)"
+  while true; do
+    local inv aws_rc
+    set +e
+    inv="$(
+      aws ssm get-command-invocation \
+        --region "${region}" \
+        --command-id "${command_id}" \
+        --instance-id "${instance_id}" \
+        --query '{Status:Status,ResponseCode:ResponseCode,Stdout:StandardOutputContent,Stderr:StandardErrorContent,StdoutUrl:StandardOutputUrl,StderrUrl:StandardErrorUrl}' \
+        --output json 2>&1
+    )"
+    aws_rc=$?
+    set -e
+    if [ "${aws_rc}" -ne 0 ]; then
+      if echo "${inv}" | grep -q 'InvocationDoesNotExist'; then
+        :
+      else
+        echo "${inv}" >&2
+        return "${aws_rc}"
+      fi
+    else
+      local st
+      st="$(printf '%s' "${inv}" | python3 -c 'import json,sys; print((json.loads(sys.stdin.read()).get("Status") or "").strip())')"
+      case "${st}" in
+        Pending|InProgress|Delayed|Cancelling)
+          ;;
+        *)
+          printf '%s' "${inv}"
+          return 0
+          ;;
+      esac
+    fi
+    local now
+    now="$(date +%s)"
+    if [ $((now - start)) -ge "${max_wait_sec}" ]; then
+      echo "[theiux] local SSM poll limit exceeded (${max_wait_sec}s); last snapshot follows" >&2
+      if [ "${aws_rc}" -eq 0 ]; then
+        printf '%s' "${inv}"
+      else
+        printf '%s' '{"Status":"InProgress","Stdout":"","Stderr":"","ResponseCode":null,"StdoutUrl":null,"StderrUrl":null}'
+      fi
+      return 0
+    fi
+    sleep "${poll_sec}"
+  done
+}
+
+# Run scripts/site-lifecycle.sh on the instance (same SSM + exit-code handling as deploy-site).
+_run_site_lifecycle_plain() {
+  local script_tail="$1"
+  ensure_ctx
+  PAYLOAD="$(cat <<EOF
+{"commands":[
+  "set -euo pipefail",
+  "cd ${DEPLOY_PATH}",
+  "PROJECT_ROOT=${DEPLOY_PATH} ${script_tail}"
+]}
+EOF
+)"
+  COMMAND_ID="$(
+    aws ssm send-command \
+      --region "${AWS_REGION}" \
+      --document-name "AWS-RunShellScript" \
+      --instance-ids "${INSTANCE_ID}" \
+      --parameters "${PAYLOAD}" \
+      --query 'Command.CommandId' \
+      --output text
+  )"
+  RESULT="$(wait_ssm "${COMMAND_ID}" "${INSTANCE_ID}" "${AWS_REGION}")"
+  printf '%s' "${RESULT}" | python3 -c "$(cat <<'PY'
+import json
+import sys
+
+raw = sys.stdin.read()
+try:
+    j = json.loads(raw)
+except json.JSONDecodeError as e:
+    print(f"[theiux] invalid JSON from get-command-invocation: {e}", file=sys.stderr)
+    raise SystemExit(2) from e
+
+out = j.get("Stdout") or ""
+err = j.get("Stderr") or ""
+print(out, end="")
+print(err, file=sys.stderr, end="")
+
+st = (j.get("Status") or "").strip()
+rc = j.get("ResponseCode")
+
+
+def to_int(x):
+    if x is None or x == "":
+        return None
+    try:
+        return int(x)
+    except (TypeError, ValueError):
+        return None
+
+
+irc = to_int(rc)
+out_url = j.get("StdoutUrl") or ""
+err_url = j.get("StderrUrl") or ""
+
+if not st:
+    print("[theiux] SSM get-command-invocation missing Status", file=sys.stderr)
+    raise SystemExit(2)
+
+if out_url or err_url:
+    print(
+        f"[theiux] note: large output may be truncated in CLI; stdout_url={out_url!r} stderr_url={err_url!r}",
+        file=sys.stderr,
+    )
+
+if st in ("Pending", "InProgress", "Delayed", "Cancelling"):
+    print(f"[theiux] SSM command not finished (Status={st})", file=sys.stderr)
+    raise SystemExit(124)
+
+if st == "Success":
+    code = irc if irc is not None else 0
+    raise SystemExit(code)
+
+if st == "TimedOut":
+    print("[theiux] SSM command timed out on the instance", file=sys.stderr)
+    raise SystemExit(124)
+
+if st == "Cancelled":
+    print("[theiux] SSM command was cancelled", file=sys.stderr)
+    raise SystemExit(130)
+
+if st == "Failed":
+    if not out and not err:
+        print(
+            "[theiux] SSM Status=Failed with empty stdout/stderr (truncated or plugin output); check SSM/CloudWatch",
+            file=sys.stderr,
+        )
+    code = irc if irc is not None else 1
+    raise SystemExit(code if code != 0 else 1)
+
+print(f"[theiux] unhandled SSM Status={st!r}", file=sys.stderr)
+raise SystemExit(1)
+PY
+)"
 }
 
 case "${command}" in
   init)
-    terraform -chdir="${TERRAFORM_DIR}" init
-    terraform -chdir="${TERRAFORM_DIR}" apply -auto-approve
+    terraform -chdir="${TERRAFORM_DIR}" init -input=false
+    terraform -chdir="${TERRAFORM_DIR}" apply -auto-approve -input=false
     cat > "${CTX_FILE}" <<EOF
 AWS_REGION=$(terraform_output aws_region)
 INSTANCE_ID=$(terraform_output instance_id)
@@ -119,10 +264,16 @@ EOF
     shift || true
     DOMAIN=""
     APPS=""
+    GIT_REPO=""
+    RUNTIME=""
+    RUNTIME_VERSION=""
     while [ $# -gt 0 ]; do
       case "$1" in
         --domain) DOMAIN="${2:-}"; shift 2 ;;
         --apps) APPS="${2:-}"; shift 2 ;;
+        --git-repo) GIT_REPO="${2:-}"; shift 2 ;;
+        --runtime) RUNTIME="${2:-}"; shift 2 ;;
+        --runtime-version) RUNTIME_VERSION="${2:-}"; shift 2 ;;
         *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
       esac
     done
@@ -134,11 +285,19 @@ EOF
     if [ -n "${APPS}" ]; then
       APPS_CMD="--apps ${APPS}"
     fi
+    GIT_REPO_CMD=""
+    if [ -n "${GIT_REPO}" ]; then
+      GIT_REPO_CMD="--git-repo ${GIT_REPO}"
+    fi
+    EXPORT_CMD=""
+    if [ -n "${RUNTIME}" ] || [ -n "${RUNTIME_VERSION}" ]; then
+      EXPORT_CMD="export THEIUX_RUNTIME='${RUNTIME}'; export THEIUX_RUNTIME_VERSION='${RUNTIME_VERSION}'; "
+    fi
     PAYLOAD="$(cat <<EOF
 {"commands":[
   "set -euo pipefail",
   "cd ${DEPLOY_PATH}",
-  "PROJECT_ROOT=${DEPLOY_PATH} scripts/site-lifecycle.sh deploy-site --domain ${DOMAIN} ${APPS_CMD}"
+  "${EXPORT_CMD}PROJECT_ROOT=${DEPLOY_PATH} scripts/site-lifecycle.sh deploy-site --domain ${DOMAIN} ${APPS_CMD} ${GIT_REPO_CMD}"
 ]}
 EOF
 )"
@@ -151,7 +310,159 @@ EOF
         --query 'Command.CommandId' \
         --output text
     )"
-    wait_ssm "${COMMAND_ID}" "${INSTANCE_ID}" "${AWS_REGION}"
+    RESULT="$(wait_ssm "${COMMAND_ID}" "${INSTANCE_ID}" "${AWS_REGION}")"
+    # stdin to python3 is JSON from get-command-invocation (script body uses -c, stdin stays the pipe)
+    printf '%s' "${RESULT}" | python3 -c "$(cat <<'PY'
+import json
+import sys
+
+raw = sys.stdin.read()
+try:
+    j = json.loads(raw)
+except json.JSONDecodeError as e:
+    print(f"[theiux] invalid JSON from get-command-invocation: {e}", file=sys.stderr)
+    raise SystemExit(2) from e
+
+out = j.get("Stdout") or ""
+err = j.get("Stderr") or ""
+print(out, end="")
+print(err, file=sys.stderr, end="")
+
+st = (j.get("Status") or "").strip()
+rc = j.get("ResponseCode")
+
+
+def to_int(x):
+    if x is None or x == "":
+        return None
+    try:
+        return int(x)
+    except (TypeError, ValueError):
+        return None
+
+
+irc = to_int(rc)
+out_url = j.get("StdoutUrl") or ""
+err_url = j.get("StderrUrl") or ""
+
+if not st:
+    print("[theiux] SSM get-command-invocation missing Status", file=sys.stderr)
+    raise SystemExit(2)
+
+if out_url or err_url:
+    print(
+        f"[theiux] note: large output may be truncated in CLI; stdout_url={out_url!r} stderr_url={err_url!r}",
+        file=sys.stderr,
+    )
+
+if st in ("Pending", "InProgress", "Delayed", "Cancelling"):
+    print(f"[theiux] SSM command not finished (Status={st})", file=sys.stderr)
+    raise SystemExit(124)
+
+if st == "Success":
+    code = irc if irc is not None else 0
+    raise SystemExit(code)
+
+if st == "TimedOut":
+    print("[theiux] SSM command timed out on the instance", file=sys.stderr)
+    raise SystemExit(124)
+
+if st == "Cancelled":
+    print("[theiux] SSM command was cancelled", file=sys.stderr)
+    raise SystemExit(130)
+
+if st == "Failed":
+    if not out and not err:
+        print(
+            "[theiux] SSM Status=Failed with empty stdout/stderr (truncated or plugin output); check SSM/CloudWatch",
+            file=sys.stderr,
+        )
+    code = irc if irc is not None else 1
+    raise SystemExit(code if code != 0 else 1)
+
+print(f"[theiux] unhandled SSM Status={st!r}", file=sys.stderr)
+raise SystemExit(1)
+PY
+)"
+    ;;
+  inventory-bench)
+    _run_site_lifecycle_plain "scripts/site-lifecycle.sh inventory-bench"
+    ;;
+  inventory-site)
+    shift || true
+    DOMAIN=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --domain) DOMAIN="${2:-}"; shift 2 ;;
+        *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
+      esac
+    done
+    if [ -z "${DOMAIN}" ]; then
+      echo "--domain is required" >&2
+      exit 1
+    fi
+    _run_site_lifecycle_plain "scripts/site-lifecycle.sh inventory-site --domain ${DOMAIN}"
+    ;;
+  get-app-only)
+    shift || true
+    GIT_REPO=""
+    GIT_BRANCH=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --git-repo) GIT_REPO="${2:-}"; shift 2 ;;
+        --branch) GIT_BRANCH="${2:-}"; shift 2 ;;
+        *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
+      esac
+    done
+    if [ -z "${GIT_REPO}" ]; then
+      echo "--git-repo is required" >&2
+      exit 1
+    fi
+    EXTRA=""
+    if [ -n "${GIT_BRANCH}" ]; then
+      EXTRA=" --branch ${GIT_BRANCH}"
+    fi
+    _run_site_lifecycle_plain "scripts/site-lifecycle.sh get-app-only --git-repo ${GIT_REPO}${EXTRA}"
+    ;;
+  install-app-on-site)
+    shift || true
+    DOMAIN=""
+    APP_NAME=""
+    GIT_REPO=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --domain) DOMAIN="${2:-}"; shift 2 ;;
+        --app) APP_NAME="${2:-}"; shift 2 ;;
+        --git-repo) GIT_REPO="${2:-}"; shift 2 ;;
+        *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
+      esac
+    done
+    if [ -z "${DOMAIN}" ] || [ -z "${APP_NAME}" ]; then
+      echo "--domain and --app are required" >&2
+      exit 1
+    fi
+    EXTRA=""
+    if [ -n "${GIT_REPO}" ]; then
+      EXTRA=" --git-repo ${GIT_REPO}"
+    fi
+    _run_site_lifecycle_plain "scripts/site-lifecycle.sh install-app-on-site --domain ${DOMAIN} --app ${APP_NAME}${EXTRA}"
+    ;;
+  uninstall-app-from-site)
+    shift || true
+    DOMAIN=""
+    APP_NAME=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --domain) DOMAIN="${2:-}"; shift 2 ;;
+        --app) APP_NAME="${2:-}"; shift 2 ;;
+        *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
+      esac
+    done
+    if [ -z "${DOMAIN}" ] || [ -z "${APP_NAME}" ]; then
+      echo "--domain and --app are required" >&2
+      exit 1
+    fi
+    _run_site_lifecycle_plain "scripts/site-lifecycle.sh uninstall-app-from-site --domain ${DOMAIN} --app ${APP_NAME}"
     ;;
   list-sites)
     ensure_ctx

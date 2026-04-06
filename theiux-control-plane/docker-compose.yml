@@ -1,0 +1,50 @@
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: theiux
+      POSTGRES_USER: theiux
+      POSTGRES_PASSWORD: theiux
+    ports: ["5434:5432"]
+    volumes: ["pg_data:/var/lib/postgresql/data"]
+
+  redis:
+    image: redis:7
+    ports: ["6381:6379"]
+
+  backend:
+    build: ./backend
+    env_file: [./backend/.env]
+    depends_on: [db, redis]
+    # Host 8001 → container 8000. Must match NEXT_PUBLIC_API_BASE_URL in frontend/.env.local
+    ports: ["8001:8000"]
+    volumes:
+      - ./backend:/app
+      # rw: UI POST /v1/admin/theiux-init runs `theiux init` and writes bin/.theiux-context
+      - ../theiux:/theiux
+      # Terraform + AWS CLI: use AWS_PROFILE in backend/.env (or AWS_* keys). Remove this line if ~/.aws is missing on the host.
+      - ~/.aws:/root/.aws:ro
+
+  worker:
+    build: ./backend
+    command: ["python", "-m", "app.worker"]
+    env_file: [./backend/.env]
+    depends_on: [db, redis]
+    volumes:
+      - ./backend:/app
+      - ../theiux:/theiux:ro
+      - ~/.aws:/root/.aws:ro
+
+  frontend:
+    build: ./frontend
+    env_file: [./frontend/.env.local]
+    depends_on: [backend]
+    ports: ["3001:3000"]
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+      # Next dev / Turbopack cache + lockfile (avoids bind-mount permission issues)
+      - /app/.next
+
+volumes:
+  pg_data:

@@ -29,9 +29,14 @@ TENANT_DB_MAX_USER_CONNECTIONS="${TENANT_DB_MAX_USER_CONNECTIONS:-15}"
 usage() {
   cat <<'EOF'
 Usage:
-  scripts/site-lifecycle.sh deploy-site --domain <domain> [--apps app1,app2] [--admin-password xxx]
+  scripts/site-lifecycle.sh deploy-site --domain <domain> [--apps app1,app2] [--git-repo <url>] [--admin-password xxx]
   scripts/site-lifecycle.sh list-sites
   scripts/site-lifecycle.sh remove-site --domain <domain> [--drop-db]
+  scripts/site-lifecycle.sh inventory-bench
+  scripts/site-lifecycle.sh inventory-site --domain <domain>
+  scripts/site-lifecycle.sh get-app-only --git-repo <url> [--branch <name>]
+  scripts/site-lifecycle.sh install-app-on-site --domain <d> --app <name> [--git-repo <url>]
+  scripts/site-lifecycle.sh uninstall-app-from-site --domain <d> --app <name>
 EOF
 }
 
@@ -40,6 +45,17 @@ require_domain() {
     echo "--domain is required" >&2
     exit 1
   fi
+}
+
+# Best-effort app folder name from git URL (used to skip redundant bench get-app on redeploy).
+app_name_from_git_repo() {
+  local repo="${1:-}"
+  repo="${repo%.git}"
+  repo="${repo%/}"
+  if [[ "${repo}" =~ ^[^:]+@[^:]+:(.+)$ ]]; then
+    repo="${BASH_REMATCH[1]}"
+  fi
+  basename "$(echo "${repo}" | tr '/' '\n' | tail -1)"
 }
 
 compose_exec() {
@@ -71,6 +87,12 @@ write_site_policy() {
   \"rate_limit_burst\": ${SITE_RATE_LIMIT_BURST},
   \"concurrent_connection_limit\": ${SITE_CONN_LIMIT}
 }
+EOF
+    bench --site '${domain}' set-config -g rate_limit_rps '${SITE_RATE_LIMIT_RPS}' >/dev/null
+    bench --site '${domain}' set-config -g rate_limit_burst '${SITE_RATE_LIMIT_BURST}' >/dev/null
+    bench --site '${domain}' set-config -g connection_limit '${SITE_CONN_LIMIT}' >/dev/null
+  "
+}
 
 enforce_tenant_db_fairness() {
   compose_exec "
@@ -85,12 +107,6 @@ enforce_tenant_db_fairness() {
 ALTER USER '\${db_name}'@'%' WITH MAX_USER_CONNECTIONS ${TENANT_DB_MAX_USER_CONNECTIONS};
 ALTER USER '\${db_name}'@'localhost' WITH MAX_USER_CONNECTIONS ${TENANT_DB_MAX_USER_CONNECTIONS};
 SQL
-  "
-}
-EOF
-    bench --site '${domain}' set-config -g rate_limit_rps '${SITE_RATE_LIMIT_RPS}' >/dev/null
-    bench --site '${domain}' set-config -g rate_limit_burst '${SITE_RATE_LIMIT_BURST}' >/dev/null
-    bench --site '${domain}' set-config -g connection_limit '${SITE_CONN_LIMIT}' >/dev/null
   "
 }
 
@@ -131,20 +147,41 @@ case "${command}" in
     domain=""
     apps="${APPS_TO_INSTALL:-frappe}"
     admin_password="${ADMIN_PASSWORD:-admin}"
+    git_repo=""
     while [ $# -gt 0 ]; do
       case "$1" in
         --domain) domain="${2:-}"; shift 2 ;;
         --apps) apps="${2:-}"; shift 2 ;;
         --admin-password) admin_password="${2:-}"; shift 2 ;;
+        --git-repo) git_repo="${2:-}"; shift 2 ;;
         *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
       esac
     done
     require_domain
 
+    if [ -n "${THEIUX_RUNTIME:-}" ] || [ -n "${THEIUX_RUNTIME_VERSION:-}" ]; then
+      echo "[theiux] runtime=${THEIUX_RUNTIME:-unset}:${THEIUX_RUNTIME_VERSION:-unset}" >&2
+    fi
+
+    if [ -n "${git_repo}" ]; then
+      _app_name="$(app_name_from_git_repo "${git_repo}")"
+      compose_exec "
+        set -euo pipefail
+        cd '${BENCH_DIR}'
+        if [ -n \"${_app_name}\" ] && [ -d \"apps/${_app_name}\" ]; then
+          echo \"[theiux] app source already present at apps/${_app_name}, skipping bench get-app\" >&2
+        else
+          bench get-app '${git_repo}'
+        fi
+      "
+    fi
+
     compose_exec "
       set -euo pipefail
       cd '${BENCH_DIR}'
-      if [ ! -f 'sites/${domain}/site_config.json' ]; then
+      if [ -f 'sites/${domain}/site_config.json' ]; then
+        echo \"[theiux] site ${domain} already exists, skipping bench new-site\" >&2
+      else
         bench new-site '${domain}' \
           --db-root-username root \
           --db-root-password '${MYSQL_ROOT_PASSWORD}' \
@@ -202,6 +239,135 @@ case "${command}" in
     refresh_site_hosts_env
     reload_edge
     echo "Site removed: ${domain}"
+    ;;
+
+  inventory-bench)
+    compose_exec "
+      set -euo pipefail
+      cd '${BENCH_DIR}'
+      for d in apps/*/; do
+        [ -d \"\${d}\" ] || continue
+        n=\$(basename \"\${d}\")
+        if [ \"\${n}\" = 'frappe' ]; then
+          continue
+        fi
+        if [ -d \"\${d}/.git\" ]; then
+          br=\$(git -C \"\${d}\" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)
+          sha=\$(git -C \"\${d}\" rev-parse --short HEAD 2>/dev/null || echo '')
+          msg=\$(git -C \"\${d}\" log -1 --pretty=%s 2>/dev/null | head -c 500 || echo '')
+          printf 'source|%s|%s|%s|%s\n' \"\${n}\" \"\${br}\" \"\${sha}\" \"\${msg}\"
+        fi
+      done
+    "
+    ;;
+
+  inventory-site)
+    domain=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --domain) domain="${2:-}"; shift 2 ;;
+        *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
+      esac
+    done
+    require_domain
+    compose_exec "
+      set -euo pipefail
+      cd '${BENCH_DIR}'
+      bench --site '${domain}' list-apps 2>/dev/null | while IFS= read -r line; do
+        line=\$(echo \"\${line}\" | sed 's/^[[:space:]]*//;s/[[:space:]]*\$//')
+        [ -z \"\${line}\" ] && continue
+        case \"\${line}\" in
+          '*'*) continue ;;
+        esac
+        printf 'installed|%s\n' \"\${line}\"
+      done
+    "
+    ;;
+
+  get-app-only)
+    git_repo=""
+    git_branch=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --git-repo) git_repo="${2:-}"; shift 2 ;;
+        --branch) git_branch="${2:-}"; shift 2 ;;
+        *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
+      esac
+    done
+    if [ -z "${git_repo}" ]; then
+      echo "--git-repo is required" >&2
+      exit 1
+    fi
+    if [ -n "${git_branch}" ]; then
+      compose_exec "
+      set -euo pipefail
+      cd '${BENCH_DIR}'
+      bench get-app '${git_repo}' --branch '${git_branch}'
+    "
+    else
+      compose_exec "
+      set -euo pipefail
+      cd '${BENCH_DIR}'
+      bench get-app '${git_repo}'
+    "
+    fi
+    ;;
+
+  install-app-on-site)
+    domain=""
+    app_name=""
+    git_repo=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --domain) domain="${2:-}"; shift 2 ;;
+        --app) app_name="${2:-}"; shift 2 ;;
+        --git-repo) git_repo="${2:-}"; shift 2 ;;
+        *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
+      esac
+    done
+    require_domain
+    if [ -z "${app_name}" ]; then
+      echo "--app is required" >&2
+      exit 1
+    fi
+    compose_exec "
+      set -euo pipefail
+      cd '${BENCH_DIR}'
+      if [ ! -d \"apps/${app_name}\" ]; then
+        if [ -z '${git_repo}' ]; then
+          echo 'app not present on bench and no --git-repo provided' >&2
+          exit 1
+        fi
+        bench get-app '${git_repo}'
+      fi
+      bench --site '${domain}' install-app '${app_name}'
+    "
+    ;;
+
+  uninstall-app-from-site)
+    domain=""
+    app_name=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --domain) domain="${2:-}"; shift 2 ;;
+        --app) app_name="${2:-}"; shift 2 ;;
+        *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
+      esac
+    done
+    require_domain
+    if [ -z "${app_name}" ]; then
+      echo "--app is required" >&2
+      exit 1
+    fi
+    if [ "${app_name}" = 'frappe' ]; then
+      echo 'refusing to uninstall frappe' >&2
+      exit 1
+    fi
+    compose_exec "
+      set -euo pipefail
+      cd '${BENCH_DIR}'
+      bench --site '${domain}' uninstall-app '${app_name}' --yes --no-backup || bench --site '${domain}' uninstall-app '${app_name}' --yes
+    "
     ;;
 
   *)
