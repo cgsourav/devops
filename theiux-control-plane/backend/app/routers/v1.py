@@ -19,7 +19,7 @@ from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, Depends, Query, Request, Response
 from fastapi.security import OAuth2PasswordRequestForm
 from rq import Retry
-from sqlalchemy import select, text
+from sqlalchemy import desc, select, text
 from sqlalchemy.orm import Session
 
 from app.auth import create_access_token, create_refresh_token, decode_token, hash_password, verify_password
@@ -75,6 +75,7 @@ from app.schemas import (
     TheiuxInitIn,
     TheiuxInitOut,
     TheiuxInitStartOut,
+    TheiuxInitStateOut,
     TheiuxInitStatusOut,
     TeamInviteIn,
     TeamInviteOut,
@@ -334,6 +335,11 @@ def _run_theiux_init_subprocess(payload: TheiuxInitIn) -> tuple[int, str, str]:
         return -1, out, err
 
 
+def _theiux_context_path() -> Path:
+    cli = Path(settings.theiux_cli_path)
+    return cli.resolve().parent.parent / 'bin' / '.theiux-context'
+
+
 def _append_init_log(job_id: str, line: str) -> None:
     with _init_jobs_lock:
         j = _init_jobs.get(job_id)
@@ -528,6 +534,46 @@ def admin_theiux_init_status(
             db.commit()
             j['audited'] = True
         return out
+
+
+@router.get('/admin/theiux-init/state', response_model=TheiuxInitStateOut, tags=['admin'])
+def admin_theiux_init_state(
+    db: Session = Depends(get_db),
+    user: User = Depends(require_min_role('admin')),
+) -> TheiuxInitStateOut:
+    context_path = _theiux_context_path()
+    context_exists = context_path.is_file()
+
+    last_success_at: str | None = None
+    last_success_exit_code: int | None = None
+    recent = list(
+        db.scalars(
+            select(AuditLog)
+            .where(AuditLog.action == 'theiux_init', AuditLog.user_id == user.id)
+            .order_by(desc(AuditLog.created_at))
+            .limit(25)
+        ).all()
+    )
+    for row in recent:
+        meta = row.meta or {}
+        if bool(meta.get('ok')) is True:
+            last_success_at = row.created_at.isoformat() if row.created_at else None
+            raw_exit = meta.get('exit_code')
+            if isinstance(raw_exit, int):
+                last_success_exit_code = raw_exit
+            elif isinstance(raw_exit, str) and raw_exit.isdigit():
+                last_success_exit_code = int(raw_exit)
+            else:
+                last_success_exit_code = None
+            break
+
+    return TheiuxInitStateOut(
+        context_file_exists=context_exists,
+        context_file_path=str(context_path),
+        last_success_at=last_success_at,
+        last_success_exit_code=last_success_exit_code,
+        is_initialized=context_exists,
+    )
 
 
 @router.get('/plans', response_model=list[PlanOut], tags=['plans'])

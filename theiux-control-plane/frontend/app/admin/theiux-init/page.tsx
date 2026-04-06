@@ -35,6 +35,13 @@ type TheiuxInitStatusOut = {
   stdout: string
   stderr: string
 }
+type TheiuxInitStateOut = {
+  context_file_exists: boolean
+  context_file_path: string
+  last_success_at?: string | null
+  last_success_exit_code?: number | null
+  is_initialized: boolean
+}
 
 export default function TheiuxInitPage() {
   const [token, setToken] = useState('')
@@ -49,6 +56,9 @@ export default function TheiuxInitPage() {
   const [elapsedSec, setElapsedSec] = useState(0)
   const [initJobId, setInitJobId] = useState<string | null>(null)
   const [liveLogs, setLiveLogs] = useState<string[]>([])
+  const [initState, setInitState] = useState<TheiuxInitStateOut | null>(null)
+  const [loadingInitState, setLoadingInitState] = useState(false)
+  const [initStateError, setInitStateError] = useState('')
 
   const [awsRegion, setAwsRegion] = useState('us-east-1')
   const [repoUrl, setRepoUrl] = useState('')
@@ -119,6 +129,29 @@ export default function TheiuxInitPage() {
     return () => window.clearInterval(id)
   }, [running, token, initJobId])
 
+  useEffect(() => {
+    if (!token || loadingMe || forbidden) return
+    let active = true
+    setLoadingInitState(true)
+    setInitStateError('')
+    apiFetch<TheiuxInitStateOut>('/admin/theiux-init/state', {}, token)
+      .then((state) => {
+        if (!active) return
+        setInitState(state)
+      })
+      .catch((e) => {
+        if (!active) return
+        setInitStateError(e instanceof ApiError ? e.message : String(e))
+      })
+      .finally(() => {
+        if (!active) return
+        setLoadingInitState(false)
+      })
+    return () => {
+      active = false
+    }
+  }, [token, loadingMe, forbidden, running, result])
+
   const runInit = async () => {
     if (!token || forbidden) return
     setRunning(true)
@@ -171,6 +204,40 @@ export default function TheiuxInitPage() {
         <Link href="/">← Back to dashboard</Link>
       </p>
       <h1>Platform: Theiux init</h1>
+      {token && !loadingMe && !forbidden ? (
+        <section className="card grid" style={{ gap: 10 }}>
+          <div>
+            <strong>Init status:</strong>{' '}
+            {loadingInitState
+              ? 'Checking...'
+              : initState?.is_initialized
+                ? 'Initialized'
+                : 'Not initialized'}
+          </div>
+          {initState ? (
+            <>
+              <div className="muted" style={{ fontSize: 13 }}>
+                Context file: <code>{initState.context_file_path}</code>
+              </div>
+              <div className="muted" style={{ fontSize: 13 }}>
+                Last successful init:{' '}
+                {initState.last_success_at
+                  ? `${new Date(initState.last_success_at).toLocaleString()}${
+                      initState.last_success_exit_code != null
+                        ? ` (exit ${initState.last_success_exit_code})`
+                        : ''
+                    }`
+                  : 'No successful init run recorded yet'}
+              </div>
+            </>
+          ) : null}
+          {initStateError ? (
+            <div className="muted" style={{ fontSize: 13, color: 'var(--warn, #c18401)' }}>
+              Could not load init status: {initStateError}
+            </div>
+          ) : null}
+        </section>
+      ) : null}
       <section className="card">
         <p className="muted" style={{ fontSize: 14, lineHeight: 1.6 }}>
           Provisions AWS infrastructure with Terraform from the mounted <code>theiux</code> repo and writes{' '}
