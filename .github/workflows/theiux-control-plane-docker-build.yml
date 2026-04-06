@@ -6,11 +6,13 @@ on:
     paths:
       - "theiux-control-plane/**"
       - ".github/workflows/theiux-control-plane-docker-build.yml"
+      - "!theiux-control-plane/README.md"
   push:
     branches: ["main", "feature/**"]
     paths:
       - "theiux-control-plane/**"
       - ".github/workflows/theiux-control-plane-docker-build.yml"
+      - "!theiux-control-plane/README.md"
   workflow_dispatch:
 
 concurrency:
