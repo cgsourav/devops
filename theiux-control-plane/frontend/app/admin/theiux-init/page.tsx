@@ -23,6 +23,18 @@ type TheiuxInitOut = {
   stdout: string
   stderr: string
 }
+type TheiuxInitStartOut = { job_id: string; status: string }
+type TheiuxInitStatusOut = {
+  job_id: string
+  status: string
+  started_at?: string | null
+  finished_at?: string | null
+  exit_code?: number | null
+  ok?: boolean | null
+  logs: string[]
+  stdout: string
+  stderr: string
+}
 
 export default function TheiuxInitPage() {
   const [token, setToken] = useState('')
@@ -33,6 +45,10 @@ export default function TheiuxInitPage() {
   const [result, setResult] = useState<TheiuxInitOut | null>(null)
   const [err, setErr] = useState('')
   const [advanced, setAdvanced] = useState(false)
+  const [startedAt, setStartedAt] = useState<number | null>(null)
+  const [elapsedSec, setElapsedSec] = useState(0)
+  const [initJobId, setInitJobId] = useState<string | null>(null)
+  const [liveLogs, setLiveLogs] = useState<string[]>([])
 
   const [awsRegion, setAwsRegion] = useState('us-east-1')
   const [repoUrl, setRepoUrl] = useState('')
@@ -68,11 +84,49 @@ export default function TheiuxInitPage() {
     loadMe(t).catch(() => undefined)
   }, [loadMe])
 
+  useEffect(() => {
+    if (!running || !startedAt) return
+    const id = window.setInterval(() => {
+      setElapsedSec(Math.max(0, Math.floor((Date.now() - startedAt) / 1000)))
+    }, 1000)
+    return () => window.clearInterval(id)
+  }, [running, startedAt])
+
+  useEffect(() => {
+    if (!running || !token || !initJobId) return
+    const id = window.setInterval(async () => {
+      try {
+        const st = await apiFetch<TheiuxInitStatusOut>(`/admin/theiux-init/${initJobId}`, {}, token)
+        setLiveLogs(st.logs || [])
+        if (st.status === 'finished') {
+          setResult({
+            ok: Boolean(st.ok),
+            exit_code: st.exit_code ?? -1,
+            stdout: st.stdout || '',
+            stderr: st.stderr || '',
+          })
+          setRunning(false)
+          setStartedAt(null)
+          setInitJobId(null)
+        }
+      } catch (e) {
+        setErr(e instanceof ApiError ? e.message : String(e))
+        setRunning(false)
+        setStartedAt(null)
+        setInitJobId(null)
+      }
+    }, 1500)
+    return () => window.clearInterval(id)
+  }, [running, token, initJobId])
+
   const runInit = async () => {
     if (!token || forbidden) return
     setRunning(true)
+    setStartedAt(Date.now())
+    setElapsedSec(0)
     setErr('')
     setResult(null)
+    setLiveLogs([])
     const body: TheiuxInitIn = {
       aws_region: awsRegion.trim(),
       repo_url: repoUrl.trim(),
@@ -96,16 +150,16 @@ export default function TheiuxInitPage() {
       body.root_volume_size_gb = n
     }
     try {
-      const r = await apiFetch<TheiuxInitOut>(
-        '/admin/theiux-init',
+      const started = await apiFetch<TheiuxInitStartOut>(
+        '/admin/theiux-init/start',
         { method: 'POST', body: JSON.stringify(body) },
         token
       )
-      setResult(r)
+      setInitJobId(started.job_id)
     } catch (e) {
       setErr(e instanceof ApiError ? e.message : String(e))
-    } finally {
       setRunning(false)
+      setStartedAt(null)
     }
   }
 
@@ -253,6 +307,22 @@ export default function TheiuxInitPage() {
             <button type="button" className="btn" disabled={running || !canSubmit} onClick={() => runInit()}>
               {running ? 'Running Terraform apply…' : 'Run theiux init'}
             </button>
+            {running && (
+              <div className="card" role="status" aria-live="polite" style={{ marginTop: 8 }}>
+                <strong>Provisioning in progress</strong>
+                <p className="muted" style={{ marginBottom: 0 }}>
+                  Elapsed: {elapsedSec}s. This can take several minutes. Do not close this page while Terraform apply is running.
+                </p>
+                <div style={{ marginTop: 10 }}>
+                  <div className="muted" style={{ fontSize: 12, marginBottom: 4 }}>
+                    Live init logs ({liveLogs.length})
+                  </div>
+                  <pre style={{ fontSize: 12, overflow: 'auto', maxHeight: 260, margin: 0 }}>
+                    {liveLogs.length ? liveLogs.join('\n') : 'Waiting for Terraform output...'}
+                  </pre>
+                </div>
+              </div>
+            )}
           </section>
         </>
       )}

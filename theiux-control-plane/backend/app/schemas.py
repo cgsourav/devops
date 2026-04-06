@@ -117,6 +117,23 @@ class TheiuxInitOut(BaseModel):
     stderr: str = ''
 
 
+class TheiuxInitStartOut(BaseModel):
+    job_id: str
+    status: str
+
+
+class TheiuxInitStatusOut(BaseModel):
+    job_id: str
+    status: str
+    started_at: str | None = None
+    finished_at: str | None = None
+    exit_code: int | None = None
+    ok: bool | None = None
+    logs: list[str] = Field(default_factory=list)
+    stdout: str = ''
+    stderr: str = ''
+
+
 # --- Plans & apps ---
 
 
