@@ -248,6 +248,13 @@ class BenchSourceAppOut(BaseModel):
     created_at: datetime
 
 
+class BenchReconcileJobsOut(BaseModel):
+    ok: bool = True
+    bench_id: str
+    reclaimed_jobs: int
+    threshold_minutes: int
+
+
 class AppPresetOut(BaseModel):
     id: str
     label: str

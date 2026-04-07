@@ -12,6 +12,8 @@ usage() {
   cat <<'EOF'
 Usage:
   theiux init
+  theiux preflight-host
+  theiux bootstrap-host
   theiux deploy <app>
   theiux rollback <app>
   theiux destroy <app>
@@ -36,6 +38,8 @@ ensure_ctx() {
   fi
   # shellcheck disable=SC1090
   source "${CTX_FILE}"
+  # Linux account on the EC2 host used for git, docker compose, and site-lifecycle (not root).
+  THEIUX_REMOTE_USER="${THEIUX_REMOTE_USER:-frappe}"
 }
 
 terraform_output() {
@@ -99,18 +103,28 @@ wait_ssm() {
   done
 }
 
+# Emit SSM --parameters JSON: run host_script on the instance as THEIUX_REMOTE_USER (never as root for app work).
+_ssm_parameters_json_as_remote_user() {
+  local host_script="$1"
+  _THEIUX_HOST_SCRIPT="${host_script}" _THEIUX_REMOTE_USER_FOR_PAYLOAD="${THEIUX_REMOTE_USER}" python3 <<'PY'
+import json, os, shlex
+
+user = os.environ["_THEIUX_REMOTE_USER_FOR_PAYLOAD"]
+inner = os.environ["_THEIUX_HOST_SCRIPT"]
+remote = "sudo -u %s -H /bin/bash -lc %s" % (shlex.quote(user), shlex.quote(inner))
+print(json.dumps({"commands": ["set -eu", remote]}))
+PY
+}
+
 # Run scripts/site-lifecycle.sh on the instance (same SSM + exit-code handling as deploy-site).
 _run_site_lifecycle_plain() {
-  local script_tail="$1"
+  local script_tail="$1" host_script
   ensure_ctx
-  PAYLOAD="$(cat <<EOF
-{"commands":[
-  "set -euo pipefail",
-  "cd ${DEPLOY_PATH}",
-  "PROJECT_ROOT=${DEPLOY_PATH} ${script_tail}"
-]}
-EOF
-)"
+  host_script="set -eu
+if [ -d '${DEPLOY_PATH}/theiux/scripts' ]; then cd '${DEPLOY_PATH}/theiux'; PROJECT_ROOT='${DEPLOY_PATH}/theiux'; else cd '${DEPLOY_PATH}'; PROJECT_ROOT='${DEPLOY_PATH}'; fi
+export PROJECT_ROOT
+${script_tail}"
+  PAYLOAD="$(_ssm_parameters_json_as_remote_user "${host_script}")"
   COMMAND_ID="$(
     aws ssm send-command \
       --region "${AWS_REGION}" \
@@ -220,22 +234,144 @@ AWS_REGION=$(terraform_output aws_region)
 INSTANCE_ID=$(terraform_output instance_id)
 SSM_PARAMETER_PATH=$(terraform_output ssm_parameter_path)
 DEPLOY_PATH=$(terraform_output deploy_path)
+REPO_URL=$(terraform_output repo_url)
+REPO_REF=${TF_VAR_repo_ref:-main}
+THEIUX_REMOTE_USER=frappe
 EOF
     echo "Initialized infrastructure."
     echo "Instance: $(terraform_output instance_id)"
     echo "ECR: $(terraform_output ecr_repository_url)"
     ;;
-  deploy)
+  preflight-host)
     ensure_ctx
-    IMAGE_TAG="${IMAGE_TAG:-$(git -C "${ROOT_DIR}" rev-parse --short HEAD)}"
     PAYLOAD="$(cat <<EOF
 {"commands":[
-  "set -euo pipefail",
-  "cd ${DEPLOY_PATH}",
-  "PROJECT_ROOT=${DEPLOY_PATH} AWS_REGION=${AWS_REGION} PARAMETER_PATH=${SSM_PARAMETER_PATH} scripts/ssm-deploy.sh ${IMAGE_TAG}"
+  "set -eu",
+  "if [ -d '${DEPLOY_PATH}' ]; then echo 'CHECK deploy_path ok'; else echo 'CHECK deploy_path missing'; fi",
+  "if command -v docker >/dev/null 2>&1; then echo 'CHECK docker ok'; else echo 'CHECK docker missing'; fi",
+  "if id -u '${THEIUX_REMOTE_USER}' >/dev/null 2>&1; then echo 'CHECK remote_user ok'; else echo 'CHECK remote_user missing'; fi",
+  "if command -v sudo >/dev/null 2>&1 && sudo -u '${THEIUX_REMOTE_USER}' -H docker info >/dev/null 2>&1; then echo 'CHECK remote_docker ok'; else echo 'CHECK remote_docker missing'; fi",
+  "if command -v aws >/dev/null 2>&1; then echo 'CHECK aws ok'; else echo 'CHECK aws missing'; fi",
+  "if [ -d '${DEPLOY_PATH}/theiux' ] || [ -d '${DEPLOY_PATH}' ]; then echo 'CHECK runtime_path ok'; else echo 'CHECK runtime_path missing'; fi",
+  "if [ -f '${DEPLOY_PATH}/theiux/.env' ] || [ -f '${DEPLOY_PATH}/.env' ]; then echo 'CHECK env ok'; else echo 'CHECK env missing'; fi",
+  "if [ -f '${DEPLOY_PATH}/theiux/scripts/site-lifecycle.sh' ] || [ -f '${DEPLOY_PATH}/scripts/site-lifecycle.sh' ]; then echo 'CHECK scripts ok'; else echo 'CHECK scripts missing'; fi",
+  "if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then echo 'CHECK compose ok'; else echo 'CHECK compose missing'; fi"
 ]}
 EOF
 )"
+    COMMAND_ID="$(
+      aws ssm send-command \
+        --region "${AWS_REGION}" \
+        --document-name "AWS-RunShellScript" \
+        --instance-ids "${INSTANCE_ID}" \
+        --parameters "${PAYLOAD}" \
+        --query 'Command.CommandId' \
+        --output text
+    )"
+    RESULT="$(wait_ssm "${COMMAND_ID}" "${INSTANCE_ID}" "${AWS_REGION}")"
+    printf '%s' "${RESULT}" | python3 -c "$(cat <<'PY'
+import json, sys
+j = json.loads(sys.stdin.read())
+out = j.get("Stdout") or ""
+err = j.get("Stderr") or ""
+print(out, end="")
+print(err, file=sys.stderr, end="")
+st = (j.get("Status") or "").strip()
+if st != "Success":
+    raise SystemExit(1)
+missing = [ln for ln in out.splitlines() if ln.startswith("CHECK ") and ln.endswith(" missing")]
+if missing:
+    for ln in missing:
+        print(f"[theiux] preflight missing: {ln[6:]}", file=sys.stderr)
+    raise SystemExit(3)
+raise SystemExit(0)
+PY
+)"
+    ;;
+  bootstrap-host)
+    ensure_ctx
+    REPO_URL_EFFECTIVE="${REPO_URL:-${TF_VAR_repo_url:-}}"
+    if [ -z "${REPO_URL_EFFECTIVE}" ] && [ -d "${ROOT_DIR}/../.git" ]; then
+      REPO_URL_EFFECTIVE="$(git -C "${ROOT_DIR}/.." remote get-url origin 2>/dev/null || true)"
+    fi
+    REPO_REF_EFFECTIVE="${REPO_REF:-${TF_VAR_repo_ref:-}}"
+    if [ -z "${REPO_REF_EFFECTIVE}" ] && [ -d "${ROOT_DIR}/../.git" ]; then
+      REPO_REF_EFFECTIVE="$(git -C "${ROOT_DIR}/.." rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+    fi
+    REPO_REF_EFFECTIVE="${REPO_REF_EFFECTIVE:-main}"
+    if [ -z "${REPO_URL_EFFECTIVE}" ]; then
+      echo "[theiux] Unable to determine REPO_URL for bootstrap-host." >&2
+      echo "[theiux] Set REPO_URL in ${CTX_FILE} or export TF_VAR_repo_url." >&2
+      exit 2
+    fi
+    GHCR_FALLBACK_REPO=""
+    if [[ "${REPO_URL_EFFECTIVE}" =~ github.com[:/]+([^/]+)/ ]]; then
+      GHCR_FALLBACK_REPO="ghcr.io/${BASH_REMATCH[1]}/theiux-frappe"
+    fi
+    PAYLOAD="$(cat <<EOF
+{"commands":[
+  "set -eu",
+  "export DEBIAN_FRONTEND=noninteractive",
+  "if ! command -v git >/dev/null 2>&1; then apt-get update && apt-get install -y git ca-certificates curl gnupg lsb-release unzip jq python3 python3-pip sudo; fi",
+  "if ! command -v aws >/dev/null 2>&1; then apt-get update && apt-get install -y python3-pip && python3 -m pip install --break-system-packages --upgrade awscli; fi",
+  "if ! command -v docker >/dev/null 2>&1; then apt-get update && (apt-get install -y docker.io docker-compose-plugin || apt-get install -y docker.io docker-compose); fi",
+  "if ! docker compose version >/dev/null 2>&1; then apt-get update && apt-get install -y docker-compose-v2 || true; fi",
+  "if ! docker compose version >/dev/null 2>&1 && command -v docker-compose >/dev/null 2>&1; then install -m 0755 -d /usr/local/lib/docker/cli-plugins; cat > /usr/local/lib/docker/cli-plugins/docker-compose <<'EOS'\n#!/usr/bin/env bash\nexec docker-compose \"$@\"\nEOS\nchmod +x /usr/local/lib/docker/cli-plugins/docker-compose; fi",
+  "if ! id -u '${THEIUX_REMOTE_USER}' >/dev/null 2>&1; then useradd --create-home --shell /bin/bash '${THEIUX_REMOTE_USER}'; fi",
+  "usermod -aG docker '${THEIUX_REMOTE_USER}' || true",
+  "mkdir -p '${DEPLOY_PATH}'",
+  "if [ ! -d '${DEPLOY_PATH}/.git' ]; then git clone '${REPO_URL_EFFECTIVE}' '${DEPLOY_PATH}'; fi",
+  "chown -R '${THEIUX_REMOTE_USER}:${THEIUX_REMOTE_USER}' '${DEPLOY_PATH}'",
+  "sudo -u '${THEIUX_REMOTE_USER}' -H git -C '${DEPLOY_PATH}' fetch --all --prune",
+  "sudo -u '${THEIUX_REMOTE_USER}' -H git -C '${DEPLOY_PATH}' checkout '${REPO_REF_EFFECTIVE}'",
+  "sudo -u '${THEIUX_REMOTE_USER}' -H git -C '${DEPLOY_PATH}' pull --ff-only",
+  "if [ -d '${DEPLOY_PATH}/theiux' ]; then cd '${DEPLOY_PATH}/theiux'; else cd '${DEPLOY_PATH}'; fi",
+  "chmod +x scripts/*.sh || true",
+  "if [ -d '${DEPLOY_PATH}/theiux' ]; then if ! PROJECT_ROOT='${DEPLOY_PATH}/theiux' AWS_REGION='${AWS_REGION}' PARAMETER_PATH='${SSM_PARAMETER_PATH}' scripts/render-env-from-ssm.sh; then echo '[theiux] bootstrap-host: render-env-from-ssm failed, falling back to .env.example' >&2; [ -f .env ] || cp .env.example .env; fi; else if ! PROJECT_ROOT='${DEPLOY_PATH}' AWS_REGION='${AWS_REGION}' PARAMETER_PATH='${SSM_PARAMETER_PATH}' scripts/render-env-from-ssm.sh; then echo '[theiux] bootstrap-host: render-env-from-ssm failed, falling back to .env.example' >&2; [ -f .env ] || cp .env.example .env; fi; fi",
+  "chown -R '${THEIUX_REMOTE_USER}:${THEIUX_REMOTE_USER}' '${DEPLOY_PATH}'",
+  "if [ -n '${GHCR_FALLBACK_REPO}' ] && grep -q '^FRAPPE_IMAGE_REPO=ghcr.io/your-github-org-or-user/theiux-frappe' .env; then sed -i \"s|^FRAPPE_IMAGE_REPO=.*|FRAPPE_IMAGE_REPO=${GHCR_FALLBACK_REPO}|\" .env; fi",
+  "sudo -u '${THEIUX_REMOTE_USER}' bash -c 'cd ${DEPLOY_PATH}/theiux 2>/dev/null || cd ${DEPLOY_PATH}; docker compose --profile internal-db --profile internal-redis up -d || docker compose up -d'",
+  "echo '[theiux] bootstrap-host completed'"
+]}
+EOF
+)"
+    COMMAND_ID="$(
+      aws ssm send-command \
+        --region "${AWS_REGION}" \
+        --document-name "AWS-RunShellScript" \
+        --instance-ids "${INSTANCE_ID}" \
+        --parameters "${PAYLOAD}" \
+        --query 'Command.CommandId' \
+        --output text
+    )"
+    RESULT="$(wait_ssm "${COMMAND_ID}" "${INSTANCE_ID}" "${AWS_REGION}")"
+    printf '%s' "${RESULT}" | python3 -c "$(cat <<'PY'
+import json, sys
+j = json.loads(sys.stdin.read())
+out = j.get("Stdout") or ""
+err = j.get("Stderr") or ""
+print(out, end="")
+print(err, file=sys.stderr, end="")
+st = (j.get("Status") or "").strip()
+rc = j.get("ResponseCode")
+if st == "Success":
+    raise SystemExit(0 if rc in (None, 0, "0") else int(rc))
+if st in ("TimedOut",):
+    raise SystemExit(124)
+if st in ("Cancelled",):
+    raise SystemExit(130)
+raise SystemExit(int(rc) if isinstance(rc, int) and rc != 0 else 1)
+PY
+)"
+    ;;
+  deploy)
+    ensure_ctx
+    IMAGE_TAG="${IMAGE_TAG:-$(git -C "${ROOT_DIR}" rev-parse --short HEAD)}"
+    host_script="set -eu
+RUNTIME_PATH='${DEPLOY_PATH}'; if [ -d '${DEPLOY_PATH}/theiux/scripts' ]; then RUNTIME_PATH='${DEPLOY_PATH}/theiux'; fi
+cd \"\$RUNTIME_PATH\"
+PROJECT_ROOT=\"\$RUNTIME_PATH\" AWS_REGION=${AWS_REGION} PARAMETER_PATH=${SSM_PARAMETER_PATH} scripts/ssm-deploy.sh ${IMAGE_TAG}"
+    PAYLOAD="$(_ssm_parameters_json_as_remote_user "${host_script}")"
     COMMAND_ID="$(
       aws ssm send-command \
         --region "${AWS_REGION}" \
@@ -250,14 +386,11 @@ EOF
     ;;
   rollback)
     ensure_ctx
-    PAYLOAD="$(cat <<EOF
-{"commands":[
-  "set -euo pipefail",
-  "cd ${DEPLOY_PATH}",
-  "PROJECT_ROOT=${DEPLOY_PATH} scripts/rollback.sh"
-]}
-EOF
-)"
+    host_script="set -eu
+RUNTIME_PATH='${DEPLOY_PATH}'; if [ -d '${DEPLOY_PATH}/theiux/scripts' ]; then RUNTIME_PATH='${DEPLOY_PATH}/theiux'; fi
+cd \"\$RUNTIME_PATH\"
+PROJECT_ROOT=\"\$RUNTIME_PATH\" scripts/rollback.sh"
+    PAYLOAD="$(_ssm_parameters_json_as_remote_user "${host_script}")"
     COMMAND_ID="$(
       aws ssm send-command \
         --region "${AWS_REGION}" \
@@ -309,14 +442,11 @@ EOF
     if [ -n "${RUNTIME}" ] || [ -n "${RUNTIME_VERSION}" ]; then
       EXPORT_CMD="export THEIUX_RUNTIME='${RUNTIME}'; export THEIUX_RUNTIME_VERSION='${RUNTIME_VERSION}'; "
     fi
-    PAYLOAD="$(cat <<EOF
-{"commands":[
-  "set -euo pipefail",
-  "cd ${DEPLOY_PATH}",
-  "${EXPORT_CMD}PROJECT_ROOT=${DEPLOY_PATH} scripts/site-lifecycle.sh deploy-site --domain ${DOMAIN} ${APPS_CMD} ${GIT_REPO_CMD}"
-]}
-EOF
-)"
+    host_script="set -eu
+RUNTIME_PATH='${DEPLOY_PATH}'; if [ -d '${DEPLOY_PATH}/theiux/scripts' ]; then RUNTIME_PATH='${DEPLOY_PATH}/theiux'; fi
+cd \"\$RUNTIME_PATH\"
+${EXPORT_CMD}PROJECT_ROOT=\"\$RUNTIME_PATH\" scripts/site-lifecycle.sh deploy-site --domain ${DOMAIN} ${APPS_CMD} ${GIT_REPO_CMD}"
+    PAYLOAD="$(_ssm_parameters_json_as_remote_user "${host_script}")"
     COMMAND_ID="$(
       aws ssm send-command \
         --region "${AWS_REGION}" \
@@ -482,14 +612,11 @@ PY
     ;;
   list-sites)
     ensure_ctx
-    PAYLOAD="$(cat <<EOF
-{"commands":[
-  "set -euo pipefail",
-  "cd ${DEPLOY_PATH}",
-  "PROJECT_ROOT=${DEPLOY_PATH} scripts/site-lifecycle.sh list-sites"
-]}
-EOF
-)"
+    host_script="set -eu
+RUNTIME_PATH='${DEPLOY_PATH}'; if [ -d '${DEPLOY_PATH}/theiux/scripts' ]; then RUNTIME_PATH='${DEPLOY_PATH}/theiux'; fi
+cd \"\$RUNTIME_PATH\"
+PROJECT_ROOT=\"\$RUNTIME_PATH\" scripts/site-lifecycle.sh list-sites"
+    PAYLOAD="$(_ssm_parameters_json_as_remote_user "${host_script}")"
     COMMAND_ID="$(
       aws ssm send-command \
         --region "${AWS_REGION}" \
@@ -521,14 +648,11 @@ EOF
     if [ "${DROP_DB}" = "true" ]; then
       DROP_DB_FLAG="--drop-db"
     fi
-    PAYLOAD="$(cat <<EOF
-{"commands":[
-  "set -euo pipefail",
-  "cd ${DEPLOY_PATH}",
-  "PROJECT_ROOT=${DEPLOY_PATH} scripts/site-lifecycle.sh remove-site --domain ${DOMAIN} ${DROP_DB_FLAG}"
-]}
-EOF
-)"
+    host_script="set -eu
+RUNTIME_PATH='${DEPLOY_PATH}'; if [ -d '${DEPLOY_PATH}/theiux/scripts' ]; then RUNTIME_PATH='${DEPLOY_PATH}/theiux'; fi
+cd \"\$RUNTIME_PATH\"
+PROJECT_ROOT=\"\$RUNTIME_PATH\" scripts/site-lifecycle.sh remove-site --domain ${DOMAIN} ${DROP_DB_FLAG}"
+    PAYLOAD="$(_ssm_parameters_json_as_remote_user "${host_script}")"
     COMMAND_ID="$(
       aws ssm send-command \
         --region "${AWS_REGION}" \
@@ -548,18 +672,15 @@ EOF
         echo "Usage: theiux health site <domain>" >&2
         exit 1
       fi
-      HEALTH_CMD="PROJECT_ROOT=${DEPLOY_PATH} scripts/site-health.sh site ${DOMAIN}"
+      HEALTH_CMD="PROJECT_ROOT=\"\$RUNTIME_PATH\" scripts/site-health.sh site ${DOMAIN}"
     else
-      HEALTH_CMD="PROJECT_ROOT=${DEPLOY_PATH} scripts/site-health.sh summary"
+      HEALTH_CMD="PROJECT_ROOT=\"\$RUNTIME_PATH\" scripts/site-health.sh summary"
     fi
-    PAYLOAD="$(cat <<EOF
-{"commands":[
-  "set -euo pipefail",
-  "cd ${DEPLOY_PATH}",
-  "${HEALTH_CMD}"
-]}
-EOF
-)"
+    host_script="set -eu
+RUNTIME_PATH='${DEPLOY_PATH}'; if [ -d '${DEPLOY_PATH}/theiux/scripts' ]; then RUNTIME_PATH='${DEPLOY_PATH}/theiux'; fi
+cd \"\$RUNTIME_PATH\"
+${HEALTH_CMD}"
+    PAYLOAD="$(_ssm_parameters_json_as_remote_user "${host_script}")"
     COMMAND_ID="$(
       aws ssm send-command \
         --region "${AWS_REGION}" \
@@ -587,14 +708,11 @@ EOF
       echo "--site is required" >&2
       exit 1
     fi
-    PAYLOAD="$(cat <<EOF
-{"commands":[
-  "set -euo pipefail",
-  "cd ${DEPLOY_PATH}",
-  "PROJECT_ROOT=${DEPLOY_PATH} scripts/logs-site.sh --site ${SITE} --since ${SINCE}"
-]}
-EOF
-)"
+    host_script="set -eu
+RUNTIME_PATH='${DEPLOY_PATH}'; if [ -d '${DEPLOY_PATH}/theiux/scripts' ]; then RUNTIME_PATH='${DEPLOY_PATH}/theiux'; fi
+cd \"\$RUNTIME_PATH\"
+PROJECT_ROOT=\"\$RUNTIME_PATH\" scripts/logs-site.sh --site ${SITE} --since ${SINCE}"
+    PAYLOAD="$(_ssm_parameters_json_as_remote_user "${host_script}")"
     COMMAND_ID="$(
       aws ssm send-command \
         --region "${AWS_REGION}" \
@@ -622,14 +740,11 @@ EOF
       echo "--domain and --backup-file are required" >&2
       exit 1
     fi
-    PAYLOAD="$(cat <<EOF
-{"commands":[
-  "set -euo pipefail",
-  "cd ${DEPLOY_PATH}",
-  "PROJECT_ROOT=${DEPLOY_PATH} scripts/site-restore.sh --domain ${DOMAIN} --backup-file ${BACKUP_FILE}"
-]}
-EOF
-)"
+    host_script="set -eu
+RUNTIME_PATH='${DEPLOY_PATH}'; if [ -d '${DEPLOY_PATH}/theiux/scripts' ]; then RUNTIME_PATH='${DEPLOY_PATH}/theiux'; fi
+cd \"\$RUNTIME_PATH\"
+PROJECT_ROOT=\"\$RUNTIME_PATH\" scripts/site-restore.sh --domain ${DOMAIN} --backup-file ${BACKUP_FILE}"
+    PAYLOAD="$(_ssm_parameters_json_as_remote_user "${host_script}")"
     COMMAND_ID="$(
       aws ssm send-command \
         --region "${AWS_REGION}" \

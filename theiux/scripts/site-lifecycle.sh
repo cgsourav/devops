@@ -17,6 +17,8 @@ SITE_REGISTRY_FILE="${SITE_REGISTRY_FILE:-sites-enabled.csv}"
 BENCH_DIR="${BENCH_DIR:-/home/frappe/frappe-bench}"
 HEALTH_ENDPOINT="${SITE_HEALTH_ENDPOINT:-/api/method/ping}"
 FRAPPE_SERVICE="${FRAPPE_SERVICE:-frappe}"
+FRAPPE_EXEC_USER="${FRAPPE_EXEC_USER:-frappe}"
+case "${FRAPPE_EXEC_USER}" in root | 0) FRAPPE_EXEC_USER=frappe ;; esac
 NGINX_SERVICE="${NGINX_SERVICE:-nginx}"
 CERTBOT_SERVICE="${CERTBOT_SERVICE:-certbot}"
 SITE_RATE_LIMIT_RPS="${SITE_RATE_LIMIT_RPS:-20}"
@@ -59,7 +61,11 @@ app_name_from_git_repo() {
 }
 
 compose_exec() {
-  docker compose exec -T "${FRAPPE_SERVICE}" bash -lc "$1"
+  # Bench refuses to run as root. `docker compose exec --user` is unreliable on some hosts;
+  # drop privileges with gosu like deploy.sh's run_as_frappe().
+  local _inner="$1"
+  docker compose exec -T "${FRAPPE_SERVICE}" \
+    bash -lc "gosu '${FRAPPE_EXEC_USER}' bash -lc $(printf '%q' "${_inner}")"
 }
 
 upsert_site_registry() {

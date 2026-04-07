@@ -67,6 +67,7 @@ When you finish the wizard, the **app** appears under **Your apps**. You can hav
 
 - For a **new** app, complete the wizard and click **Deploy now** — the UI moves to **step 5**, shows **pipeline stages** (for example queued → building → deploying → success or failed), and **live or polled logs**.
 - Wait until the run **succeeds** or **fails**. Large deployments can take many minutes; your operator sets timeouts.
+- On a newly provisioned host, the first deploy/get-app may take longer because the platform can automatically bootstrap missing host prerequisites before running the app lifecycle steps.
 
 ### 5. If something fails
 
