@@ -92,6 +92,25 @@ Restart **`docker compose`** so the **worker** sees **`/theiux/bin/.theiux-conte
 
 **AWS inside the worker:** The `theiux` script calls **`aws ssm`**. Compose mounts **`~/.aws`** on the worker; set **`AWS_PROFILE`** in **`backend/.env`** (shared via **`env_file`**) or set **`AWS_ACCESS_KEY_ID`** / **`AWS_SECRET_ACCESS_KEY`**.
 
+### Automatic host bootstrap during deploy/get-app
+
+The worker now runs remote readiness checks before `deploy-site` and `get-app-only`:
+
+- `theiux preflight-host` checks deploy path, Docker, AWS CLI, scripts, and `.env`.
+- If preflight reports missing prerequisites, worker runs `theiux bootstrap-host` once and re-checks preflight.
+- This keeps deployment flows automated on cold hosts without manual SSH remediation.
+
+First operations on a new instance can take longer due to package installs and repo bootstrap.
+
+Minimum IAM permissions required for this automation path:
+
+- `ssm:SendCommand`
+- `ssm:GetCommandInvocation`
+- `ssm:ListCommandInvocations`
+- `ssm:ListCommands`
+- `ssm:GetParameter`
+- `ssm:GetParameters`
+
 ### Bootstrap deploy for ERP Lab (operator CLI)
 
 End users normally use the **home page** wizard (**Use ERP Lab template** or **Start ERP Lab deploy wizard**). To enqueue the same pipeline from the host (e.g. right after creating a user), run:
@@ -195,6 +214,7 @@ Additional operator notes:
 | **401 / login failures** | JWT secret, clock skew, cookie domain if using cookie auth. |
 | **Deploy stuck** | Worker running? **`theiux`** path? AWS credentials **inside the worker container**? SSM agent on target instance? |
 | **Immediate deploy failure** | Worker logs; `theiux deploy-site` stderr in job logs; **`THEIUX_DEPLOY_TIMEOUT_SECONDS`** too low? |
+| **Bootstrap errors (`bootstrap-host` / `preflight-host`)** | Confirm SSM IAM permissions above, outbound network for package/repos, and that instance OS package manager is healthy. |
 | **Frontend cannot reach API** | **`NEXT_PUBLIC_API_BASE_URL=http://localhost:8001`**, CORS, firewall, mixed HTTP/HTTPS. |
 | **Port bind errors** | Change host ports in **`docker-compose.yml`** and **`NEXT_PUBLIC_API_BASE_URL`**. |
 

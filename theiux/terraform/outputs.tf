@@ -37,3 +37,7 @@ output "aws_region" {
 output "deploy_path" {
   value = var.deploy_path
 }
+
+output "repo_url" {
+  value = var.repo_url
+}

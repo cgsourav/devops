@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import secrets
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends
-from sqlalchemy import select
+from sqlalchemy import update, select
 from sqlalchemy.orm import Session
 
 from app.audit_service import write_audit
@@ -15,9 +16,18 @@ from app.deployment_presenter import deployment_to_out
 from app.db import get_db
 from app.deps import current_user, require_min_role
 from app.errors import raise_api_error
-from app.models import Bench, BenchSourceApp, Deployment, OrganizationMember, Site, User
+from app.models import Bench, BenchSourceApp, Deployment, Job, OrganizationMember, Site, User
 from app.routers.api_helpers import bsa_to_source_out, list_app_presets_response, slugify_bench, validate_runtime
-from app.schemas import AppPresetOut, BenchCreateIn, BenchOut, BenchSourceAppCreateIn, BenchSourceAppOut, DeploymentOut, SiteOut
+from app.schemas import (
+    AppPresetOut,
+    BenchCreateIn,
+    BenchOut,
+    BenchReconcileJobsOut,
+    BenchSourceAppCreateIn,
+    BenchSourceAppOut,
+    DeploymentOut,
+    SiteOut,
+)
 
 router = APIRouter()
 
@@ -92,6 +102,49 @@ def sync_bench(
     )
     db.commit()
     return {'ok': True, 'bench_id': bench_id, 'message': 'sync job queued'}
+
+
+@router.post('/benches/{bench_id}/reconcile-jobs', response_model=BenchReconcileJobsOut, tags=['benches'])
+def reconcile_stuck_bench_jobs(
+    bench_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_min_role('admin')),
+) -> BenchReconcileJobsOut:
+    if not user_owns_bench(db, user.id, bench_id):
+        raise_api_error(status_code=404, code='bench_not_found', message='bench not found', category='client_error')
+    stale_minutes = 10
+    stale_before = datetime.now(timezone.utc) - timedelta(minutes=stale_minutes)
+    job_ids = list(
+        db.scalars(
+            select(Job.id)
+            .join(Deployment, Job.deployment_id == Deployment.id)
+            .join(BenchSourceApp, Deployment.bench_source_app_id == BenchSourceApp.id)
+            .where(BenchSourceApp.bench_id == bench_id, Job.status == 'retrying', Job.updated_at < stale_before)
+        ).all()
+    )
+    reclaimed = 0
+    if job_ids:
+        result = db.execute(
+            update(Job)
+            .where(Job.id.in_(job_ids))
+            .values(status='dead_letter', updated_at=datetime.now(timezone.utc))
+        )
+        reclaimed = int(result.rowcount or 0)
+    write_audit(
+        db,
+        user_id=user.id,
+        action='reconcile_jobs',
+        resource_type='bench',
+        resource_id=bench_id,
+        metadata={'reclaimed_jobs': reclaimed, 'threshold_minutes': stale_minutes},
+    )
+    db.commit()
+    return BenchReconcileJobsOut(
+        ok=True,
+        bench_id=bench_id,
+        reclaimed_jobs=reclaimed,
+        threshold_minutes=stale_minutes,
+    )
 
 
 @router.get('/benches/{bench_id}/source-apps', response_model=list[BenchSourceAppOut], tags=['benches'])

@@ -114,6 +114,17 @@ def classify_failure_from_output(combined: str) -> str:
     if any(
         k in t
         for k in (
+            'bootstrap-host',
+            'automatic host bootstrap failed',
+            'preflight missing',
+            'host preflight failed after bootstrap',
+            'unable to determine repo_url for bootstrap-host',
+        )
+    ):
+        return 'bootstrap_error'
+    if any(
+        k in t
+        for k in (
             'migration error',
             'migration failed',
             'migrate.py',
@@ -148,6 +159,41 @@ def classify_failure_from_output(combined: str) -> str:
     return 'runtime_error'
 
 
+def ensure_remote_host_ready() -> Iterator[tuple[str, str]]:
+    """Run preflight, auto-bootstrap once if needed, then re-check readiness."""
+    yield '[bootstrap] Running remote host preflight checks', 'info'
+    try:
+        yield from stream_theiux_argv(['preflight-host'])
+        yield '[bootstrap] Host preflight checks passed', 'info'
+        return
+    except TheiuxDeployError as preflight_err:
+        yield f'[bootstrap] Preflight reported missing prerequisites ({preflight_err.reason}); attempting auto-bootstrap', 'error'
+
+    try:
+        yield from stream_theiux_argv(['bootstrap-host'])
+    except TheiuxDeployError as bootstrap_err:
+        raise TheiuxDeployError(
+            'automatic host bootstrap failed',
+            exit_code=bootstrap_err.exit_code,
+            category='bootstrap_error',
+            combined_output=bootstrap_err.combined_output,
+            reason='bootstrap_failed',
+        ) from bootstrap_err
+
+    yield '[bootstrap] Verifying host readiness after bootstrap', 'info'
+    try:
+        yield from stream_theiux_argv(['preflight-host'])
+    except TheiuxDeployError as postcheck_err:
+        raise TheiuxDeployError(
+            'host preflight failed after bootstrap',
+            exit_code=postcheck_err.exit_code,
+            category='bootstrap_error',
+            combined_output=postcheck_err.combined_output,
+            reason='bootstrap_incomplete',
+        ) from postcheck_err
+    yield '[bootstrap] Host is ready', 'info'
+
+
 def stream_theiux_deploy(
     *,
     domain: str,
@@ -161,6 +207,7 @@ def stream_theiux_deploy(
     Yields (line, level) where level is 'info' or 'error'.
     Raises TheiuxDeployError on non-zero exit.
     """
+    yield from ensure_remote_host_ready()
     safe_domain = _safe(domain)
     _validate_runtime(runtime, runtime_version)
     if git_repo_url:
@@ -357,7 +404,14 @@ def stream_theiux_argv(argv: list[str]) -> Iterator[tuple[str, str]]:
             reason = 'ssm_cancelled'
         elif code == 2:
             reason = 'ssm_parse_or_api_error'
-        cat = classify_failure_from_exit_and_output(code, combined)
+        if argv and argv[0] in {'bootstrap-host', 'preflight-host'}:
+            cat = 'bootstrap_error'
+            if argv[0] == 'bootstrap-host':
+                reason = 'bootstrap_failed'
+            else:
+                reason = 'preflight_failed'
+        else:
+            cat = classify_failure_from_exit_and_output(code, combined)
         raise TheiuxDeployError(
             f'theiux {" ".join(argv)} failed (exit {code})',
             exit_code=code,
@@ -377,6 +431,7 @@ def stream_theiux_inventory_site(domain: str) -> Iterator[tuple[str, str]]:
 
 
 def stream_theiux_get_app_only(git_repo_url: str, git_branch: str | None = None) -> Iterator[tuple[str, str]]:
+    yield from ensure_remote_host_ready()
     args: list[str] = ['get-app-only', '--git-repo', _validate_repo(git_repo_url)]
     if git_branch and git_branch.strip():
         args.extend(['--branch', _safe(git_branch.strip())])

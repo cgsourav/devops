@@ -39,6 +39,7 @@ type Deployment = {
 }
 
 type Plan = { id: string; name: string; price_monthly: number }
+type ReconcileJobsOut = { ok: boolean; bench_id: string; reclaimed_jobs: number; threshold_minutes: number }
 
 type Tab = 'sites' | 'apps' | 'deploys'
 
@@ -54,6 +55,7 @@ export default function BenchDetailPage() {
   const [deps, setDeps] = useState<Deployment[]>([])
   const [plans, setPlans] = useState<Plan[]>([])
   const [err, setErr] = useState('')
+  const [notice, setNotice] = useState('')
   const [busy, setBusy] = useState(false)
   const [form, setForm] = useState({
     name: '',
@@ -66,6 +68,7 @@ export default function BenchDetailPage() {
   const refresh = useCallback(async () => {
     if (!token || !benchId) return
     setErr('')
+    setNotice('')
     const [b, sa, st, d, p] = await Promise.all([
       apiFetch<Bench>(`/benches/${benchId}`, {}, token),
       apiFetch<SourceApp[]>(`/benches/${benchId}/source-apps`, {}, token),
@@ -153,6 +156,29 @@ export default function BenchDetailPage() {
     }
   }
 
+  const reconcileJobs = async () => {
+    if (!token || !canUseAdminApis(userRole || '')) {
+      setErr('Admin or owner role required to reconcile jobs.')
+      return
+    }
+    setBusy(true)
+    setErr('')
+    setNotice('')
+    try {
+      const out = await apiFetch<ReconcileJobsOut>(`/benches/${benchId}/reconcile-jobs`, { method: 'POST' }, token)
+      setNotice(
+        out.reclaimed_jobs > 0
+          ? `Cleared ${out.reclaimed_jobs} stuck job(s) older than ${out.threshold_minutes} minutes.`
+          : `No stale retrying jobs found (threshold ${out.threshold_minutes} minutes).`
+      )
+      await refresh()
+    } catch (e) {
+      setErr(e instanceof ApiError ? e.message : String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
   if (!bench) {
     return (
       <div className="container">
@@ -171,9 +197,14 @@ export default function BenchDetailPage() {
       <div className="row" style={{ justifyContent: 'space-between', flexWrap: 'wrap', gap: 12, marginBottom: 16 }}>
         <h1 style={{ margin: 0 }}>{bench.name}</h1>
         {canUseAdminApis(userRole || '') && (
-          <button type="button" className="btn secondary" disabled={busy} onClick={() => syncBench()}>
-            {busy ? '…' : 'Refresh inventory'}
-          </button>
+          <div className="row" style={{ gap: 8, flexWrap: 'wrap' }}>
+            <button type="button" className="btn secondary" disabled={busy} onClick={() => syncBench()}>
+              {busy ? '…' : 'Refresh inventory'}
+            </button>
+            <button type="button" className="btn secondary" disabled={busy} onClick={() => reconcileJobs()}>
+              {busy ? '…' : 'Clear stuck jobs'}
+            </button>
+          </div>
         )}
       </div>
       <p className="muted" style={{ fontSize: 13 }}>
@@ -182,6 +213,7 @@ export default function BenchDetailPage() {
       </p>
 
       {err && <p className="error" style={{ padding: 8, borderRadius: 8 }}>{err}</p>}
+      {notice && <p className="card" style={{ padding: 8, borderRadius: 8 }}>{notice}</p>}
 
       <div className="row" style={{ gap: 8, marginBottom: 20, flexWrap: 'wrap' }}>
         {(['sites', 'apps', 'deploys'] as const).map((t) => (
